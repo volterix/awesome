@@ -21,7 +21,9 @@ class CafeTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
         cls.cafe = srv.Cafe(os.path.join(cls.tmp, "cafe.db"), os.path.join(cls.tmp, "config.json"))
-        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(cls.cafe))
+        handler = srv.make_handler(cls.cafe)
+        handler.log_message = lambda *a: None
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
         cls.token = cls.call("/api/login", {"password": "admin123"})["token"]
@@ -166,6 +168,112 @@ class CafeTest(unittest.TestCase):
         self.call("/api/pc/PC-10/start", {"mode": "prepaid", "minutes": 45})
         cafe2 = srv.Cafe(os.path.join(self.tmp, "cafe.db"), os.path.join(self.tmp, "config.json"))
         self.assertEqual(cafe2.heartbeat("PC-10", "PC-10", "127.0.0.1", {})["state"], "active")
+
+
+    # ---- v2: games, rig register, packages, group start ----------------------
+    def test_games_catalogue_and_rig_register(self):
+        games = self.call("/api/games")
+        f1 = next(g for g in games if g["name"] == "F1 25")          # seeded starter entry
+        self.call("/api/games", {"id": f1["id"], "name": "F1 25", "launch": "steam://rungameid/123",
+                                 "category": "Racing", "max_players": 20})
+        acc = self.call("/api/games", {"name": "Assetto Corsa", "launch": r"C:\\Games\\ac.exe"})["id"]
+        self.agent("RIG-1")
+        self.call("/api/pc/RIG-1/update", {"account": "Steam: rig1_cafe", "notes": "Fanatec wheel",
+                                           "games": [f1["id"], acc, 9999]})
+        pc = next(p for p in self.call("/api/state")["pcs"] if p["id"] == "RIG-1")
+        self.assertEqual(sorted(pc["games"]), sorted([f1["id"], acc]))   # unknown id dropped
+        self.assertEqual(pc["account"], "Steam: rig1_cafe")
+        # agent launcher only receives installed games that have a launch target
+        names = [g["name"] for g in self.agent("RIG-1")["games"]]
+        self.assertEqual(sorted(names), ["Assetto Corsa", "F1 25"])
+        # deleting a game removes it from rigs
+        self.call(f"/api/games/{acc}", method="DELETE")
+        self.assertNotIn(acc, next(p for p in self.call("/api/state")["pcs"] if p["id"] == "RIG-1")["games"])
+
+    def test_shared_account_flagged(self):
+        self.agent("RIG-A"); self.agent("RIG-B")
+        self.call("/api/pc/RIG-A/update", {"account": "EA: same@x"})
+        self.call("/api/pc/RIG-B/update", {"account": "ea: SAME@x "})
+        pcs = {p["id"]: p for p in self.call("/api/state")["pcs"]}
+        self.assertEqual(pcs["RIG-A"]["shares_account_with"], ["RIG-B"])
+        r = self.call("/api/group/start", {"ids": ["RIG-A", "RIG-B"], "minutes": 30})
+        self.assertTrue(any("same game account" in w for w in r["warnings"]))
+        self.call(f"/api/group/{r['group_id']}/end", {})
+
+    def test_race_package_group_start_split_and_end(self):
+        gid = self.call("/api/games", {"name": "Race Sim", "launch": "steam://rungameid/1"})["id"]
+        ids = ["R1", "R2", "R3"]
+        for i in ids:
+            self.agent(i)
+        self.call("/api/pc/R1/update", {"games": [gid]})
+        self.call("/api/pc/R2/update", {"games": [gid]})        # R3 lacks the game
+        pkg = self.call("/api/packages", {"name": "Race night 3x1h", "minutes": 60, "price": 500,
+                                          "rigs": 3, "game_id": gid})["id"]
+        # wrong rig count is rejected
+        self.assertEqual(self.call("/api/group/start", {"ids": ids[:2], "package_id": pkg})["_status"], 400)
+        r = self.call("/api/group/start", {"ids": ids, "package_id": pkg, "label": "Team Apex"})
+        self.assertEqual(r["total"], 500)
+        self.assertTrue(any("R3" in w for w in r["warnings"]))
+        sessions = [self.agent(i) for i in ids]
+        self.assertEqual(round(sum(h["session"]["cost"] for h in sessions), 2), 500)   # split exactly
+        self.assertEqual({h["session"]["group_id"] for h in sessions}, {r["group_id"]})
+        self.assertEqual(sessions[0]["session"]["package"], "Race night 3x1h")
+        self.assertAlmostEqual(sessions[0]["session"]["remaining"], 3600, delta=3)
+        # every rig was told to launch the game (delivered with the heartbeat above)
+        self.assertTrue(all(any(c["type"] == "launch" and c["game_id"] == gid for c in h["commands"])
+                            for h in sessions))
+        # agent reports launches -> top games report
+        self.agent("R1", "launch", game_id=gid)
+        self.agent("R2", "launch", game_id=gid)
+        top = self.call("/api/report")["top_games"]
+        self.assertEqual(next(g for g in top if g["name"] == "Race Sim")["rigs"], 2)
+        end = self.call(f"/api/group/{r['group_id']}/end", {})
+        self.assertEqual(end["rigs"], 3)
+        self.assertEqual(end["amount"], 500)
+        self.assertTrue(all(self.agent(i)["state"] == "locked" for i in ids))
+
+    def test_group_start_is_all_or_nothing(self):
+        for i in ("G1", "G2"):
+            self.agent(i)
+        self.call("/api/pc/G2/start", {"mode": "prepaid", "minutes": 10})
+        before = self.call("/api/report")["totals"]["cash_collected"]
+        r = self.call("/api/group/start", {"ids": ["G1", "G2"], "minutes": 60})
+        self.assertEqual(r["_status"], 409)
+        self.assertEqual(self.agent("G1")["state"], "locked")
+        self.assertEqual(self.call("/api/report")["totals"]["cash_collected"], before)
+        self.call("/api/pc/G2/end", {})
+
+    def test_per_rig_package_and_remote_launch(self):
+        gid = self.call("/api/games", {"name": "Kart", "launch": "kart.exe"})["id"]
+        nolaunch = self.call("/api/games", {"name": "Not set up"})["id"]
+        pkg = self.call("/api/packages", {"name": "5 hours", "minutes": 300, "price": 250})["id"]
+        self.agent("K1")
+        self.assertEqual(self.call("/api/pc/K1/command", {"type": "launch", "game_id": gid})["_status"], 409)
+        r = self.call("/api/pc/K1/start", {"mode": "package", "package_id": pkg})
+        self.assertIsNone(r["group_id"])
+        hb = self.agent("K1")
+        self.assertEqual(hb["session"]["cost"], 250)
+        self.assertAlmostEqual(hb["session"]["remaining"], 18000, delta=3)
+        self.call("/api/pc/K1/command", {"type": "launch", "game_id": gid})
+        self.assertEqual(self.agent("K1")["commands"][0]["type"], "launch")
+        self.assertEqual(self.call("/api/pc/K1/command", {"type": "launch", "game_id": nolaunch})["_status"], 400)
+        self.call("/api/pc/K1/end", {})
+        self.call(f"/api/packages/{pkg}", method="DELETE")
+        self.assertNotIn(pkg, [p["id"] for p in self.call("/api/packages")])
+
+    def test_v1_database_migrates(self):
+        import sqlite3
+        path = os.path.join(self.tmp, "old.db")
+        db = sqlite3.connect(path)
+        db.executescript("CREATE TABLE pcs (id TEXT PRIMARY KEY, name TEXT, grp TEXT, created REAL);"
+                         "CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, pc_id TEXT, pc_name TEXT,"
+                         " member_id INTEGER, user_label TEXT, mode TEXT, rate REAL, started REAL, ends REAL,"
+                         " ended REAL, minutes REAL, amount REAL DEFAULT 0, prepaid REAL DEFAULT 0, end_reason TEXT);"
+                         "INSERT INTO pcs VALUES ('OLD','Old PC','Standard',0);")
+        db.commit(); db.close()
+        c = srv.Cafe(path, os.path.join(self.tmp, "config.json"))
+        self.assertEqual(c.heartbeat("OLD", "Old PC", "1.1.1.1", {})["games"], [])
+        self.assertEqual(next(p for p in c.state()["pcs"] if p["id"] == "OLD")["account"], "")
 
 
 if __name__ == "__main__":

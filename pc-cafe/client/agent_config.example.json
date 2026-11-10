@@ -4,5 +4,6 @@
   "pc_id": "",
   "name": "PC-01",
   "exit_code": "change-me",
+  "allow_desktop": false,
   "dry_run": false
 }

@@ -16,6 +16,7 @@ import json
 import os
 import platform
 import queue
+import shlex
 import socket
 import subprocess
 import sys
@@ -37,7 +38,7 @@ BG, PANEL, TEXT, MUTED, ACCENT, RED = "#0d1117", "#161b22", "#e6edf3", "#8b98a8"
 
 def load_config(args):
     cfg = {"server": "http://127.0.0.1:8080", "agent_key": "", "pc_id": "",
-           "name": "", "dry_run": False, "exit_code": "0000"}
+           "name": "", "dry_run": False, "exit_code": "0000", "allow_desktop": False}
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -127,6 +128,30 @@ def os_action(kind, dry_run):
         print("Command failed:", e, flush=True)
 
 
+def launch_target(target, dry_run):
+    """Start a game: steam://rungameid/..., an .exe/.lnk/.url path, or a full command line."""
+    target = (target or "").strip()
+    if not target:
+        return "No launch target set"
+    if dry_run:
+        print("[dry-run] would launch:", target, flush=True)
+        return None
+    try:
+        if platform.system() == "Windows":
+            if os.path.exists(target) or "://" in target:
+                os.startfile(target)          # handles .exe, .lnk, .url and steam:// links
+            else:
+                subprocess.Popen(target, shell=False)
+        elif "://" in target or os.path.exists(target) and not os.access(target, os.X_OK):
+            opener = "open" if platform.system() == "Darwin" else "xdg-open"
+            subprocess.Popen([opener, target])
+        else:
+            subprocess.Popen(shlex.split(target))
+    except OSError as e:
+        return str(e)
+    return None
+
+
 def fmt_dur(sec):
     sec = max(0, int(sec))
     return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
@@ -146,6 +171,7 @@ class AgentApp:
         self.last_ok = 0.0
         self.warned = set()
         self.cafe_name, self.currency = "CafeMaster", "₹"
+        self.games, self._games_sig = [], None
 
         self.root = tk.Tk()
         self.root.title("CafeMaster")
@@ -153,6 +179,7 @@ class AgentApp:
         self.root.protocol("WM_DELETE_WINDOW", lambda: None)
         self._build_lock()
         self._build_overlay()
+        self._build_launcher()
         self.root.bind_all("<Control-Shift-F12>", lambda e: self._staff_exit())
 
         threading.Thread(target=self.link.loop, daemon=True).start()
@@ -203,6 +230,8 @@ class AgentApp:
 
     def show_lock(self):
         self.overlay.withdraw()
+        if hasattr(self, "launcher"):
+            self.launcher.withdraw()
         self.root.deiconify()
         try:
             self.root.overrideredirect(True)
@@ -227,6 +256,8 @@ class AgentApp:
         self._place_overlay()
         self.overlay.deiconify()
         self.overlay.attributes("-topmost", True)
+        if self.games:
+            self.show_launcher()
 
     # ---- in-session overlay -------------------------------------------------
     def _build_overlay(self):
@@ -255,6 +286,9 @@ class AgentApp:
         self.o_cost.pack(anchor="w")
         self.o_end = tk.Button(self.o_detail, text="End session", command=self._logout, bg="#1f2630", fg=TEXT,
                                relief="flat", font=("Segoe UI", 9), cursor="hand2", activebackground="#2b3440")
+        self.o_games = tk.Button(self.o_detail, text="Games", command=lambda: self.show_launcher(), bg="#1f2630",
+                                 fg=TEXT, relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                                 activebackground="#2b3440")
         self.compact = False
         for w in (f, self.o_time, self.o_title):
             w.bind("<ButtonPress-1>", self._drag_start)
@@ -281,6 +315,85 @@ class AgentApp:
     def _drag_move(self, e):
         self._moved = True
         self.overlay.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    # ---- game launcher -------------------------------------------------------
+    def _build_launcher(self):
+        L = self.launcher = tk.Toplevel(self.root, bg=BG)
+        L.title("Games")
+        L.protocol("WM_DELETE_WINDOW", lambda: None)
+        try:
+            L.overrideredirect(True)
+        except tk.TclError:
+            pass
+        head = tk.Frame(L, bg=BG, padx=40, pady=24)
+        head.pack(fill="x")
+        self.g_title = tk.Label(head, text="Choose a game", font=("Segoe UI", 24, "bold"), fg=TEXT, bg=BG)
+        self.g_title.pack(side="left")
+        right = tk.Frame(head, bg=BG)
+        right.pack(side="right", padx=(0, 260))   # keep clear of the timer overlay (top-right)
+        self.g_info = tk.Label(right, font=("Segoe UI", 12), fg=MUTED, bg=BG)
+        self.g_info.pack(side="left", padx=(0, 16))
+        self.g_end = tk.Button(right, text="End session", command=self._logout, bg=PANEL, fg=TEXT, relief="flat",
+                               font=("Segoe UI", 10), padx=12, pady=4, cursor="hand2")
+        if self.cfg.get("allow_desktop"):
+            tk.Button(right, text="Desktop", command=L.withdraw, bg=PANEL, fg=TEXT, relief="flat",
+                      font=("Segoe UI", 10), padx=12, pady=4, cursor="hand2").pack(side="right", padx=(8, 0))
+        self.g_grid = tk.Frame(L, bg=BG, padx=40)
+        self.g_grid.pack(fill="both", expand=True)
+        self.g_note = tk.Label(L, font=("Segoe UI", 10), fg=MUTED, bg=BG, pady=12)
+        self.g_note.pack(side="bottom")
+        L.withdraw()
+
+    def _render_games(self):
+        sig = json.dumps(self.games, sort_keys=True)
+        if sig == self._games_sig:
+            return
+        self._games_sig = sig
+        for w in self.g_grid.winfo_children():
+            w.destroy()
+        cols = 4
+        palette = ["#1f6feb", "#8957e5", "#d29922", "#2ea043", "#e5534b", "#3fb8af", "#db61a2"]
+        for i, g in enumerate(self.games):
+            color = palette[sum(map(ord, g["name"])) % len(palette)]
+            tile = tk.Frame(self.g_grid, bg=PANEL, highlightthickness=2, highlightbackground=PANEL,
+                            cursor="hand2", width=260, height=150)
+            tile.grid(row=i // cols, column=i % cols, padx=10, pady=10, sticky="nsew")
+            tile.pack_propagate(False)
+            tk.Frame(tile, bg=color, height=6).pack(fill="x")
+            name = tk.Label(tile, text=g["name"], font=("Segoe UI", 16, "bold"), fg=TEXT, bg=PANEL,
+                            wraplength=230, justify="left")
+            name.pack(anchor="w", padx=16, pady=(18, 2))
+            cat = tk.Label(tile, text=g.get("category") or "", font=("Segoe UI", 10), fg=MUTED, bg=PANEL)
+            cat.pack(anchor="w", padx=16)
+            play = tk.Label(tile, text="▶  PLAY", font=("Segoe UI", 10, "bold"), fg=color, bg=PANEL)
+            play.pack(anchor="w", padx=16, pady=(14, 0))
+            for w in (tile, name, cat, play):
+                w.bind("<Button-1>", lambda e, gg=g: self.launch_game(gg))
+                w.bind("<Enter>", lambda e, t=tile, c=color: t.config(highlightbackground=c))
+                w.bind("<Leave>", lambda e, t=tile: t.config(highlightbackground=PANEL))
+        for c in range(cols):
+            self.g_grid.grid_columnconfigure(c, weight=1, uniform="g")
+
+    def show_launcher(self):
+        if self.state != "active" or not self.games:
+            return
+        self._render_games()
+        self.g_note.config(text="")
+        L = self.launcher
+        L.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
+        L.deiconify()
+        L.lift()
+        L.focus_force()
+        self.overlay.lift()
+
+    def launch_game(self, game):
+        err = launch_target(game.get("launch"), self.cfg.get("dry_run"))
+        if err:
+            self.popup(f"Could not start {game['name']}: {err}. Please call staff.", "Launch failed", urgent=True)
+            return
+        self.g_note.config(text=f"Starting {game['name']}…")
+        self.launcher.after(1500, self.launcher.withdraw)
+        self.link.call_async("launch", {"game_id": game["id"]}, "launched")
 
     # ---- popups -------------------------------------------------------------
     def popup(self, text, title="Message from staff", urgent=False):
@@ -350,8 +463,9 @@ class AgentApp:
         self.l_pc.config(text=f'{d["pc"]["name"]}  ·  {d["pc"]["group"]}')
         self.l_rate.config(text=f'{self.currency}{d["rate"]:g} per hour')
         self.l_conn.config(text=f"Connected to {self.cfg['server']}", fg=MUTED)
-        for c in d.get("commands", []):
-            self._run_command(c)
+        self.games = d.get("games") or []
+        if self.launcher.winfo_viewable():
+            self._render_games()
         new = d.get("session")
         if new and new.get("ends") and new["ends"] <= time.time() + self.offset:
             new = None  # already expired; server will close it on its next tick
@@ -359,6 +473,8 @@ class AgentApp:
             self.warned = set()
         self.session = new
         self._apply("active" if new else "locked")
+        for c in d.get("commands", []):   # after state change, so "launch" sees the new session
+            self._run_command(c)
 
     def _on_offline(self, err):
         if time.time() - self.last_ok > OFFLINE_GRACE:
@@ -394,6 +510,10 @@ class AgentApp:
         elif t == "lock":
             self.session = None
             self._apply("locked")
+        elif t == "launch":
+            game = next((g for g in self.games if g["id"] == c.get("game_id")), None)
+            if game and self.state == "active":
+                self.launch_game(game)
         elif t in ("shutdown", "restart", "logoff"):
             self.session = None
             self._apply("locked")
@@ -419,7 +539,8 @@ class AgentApp:
             self.root.lift()
         elif s:
             mode_txt = {"prepaid": "Prepaid", "postpaid": "Pay later", "member": "Member", "free": "Free"}
-            self.o_title.config(text=f'{self.cfg["name"]} · {s["user"]} · {mode_txt.get(s["mode"], "")}')
+            title = f'{self.cfg["name"]} · {s["user"]} · {s.get("package") or mode_txt.get(s["mode"], "")}'
+            self.o_title.config(text=title if len(title) <= 42 else title[:41] + "…")
             if s.get("ends"):
                 rem = s["ends"] - srv_now
                 self.o_time.config(text=fmt_dur(rem) + " left", fg=RED if rem < 300 else TEXT)
@@ -438,11 +559,21 @@ class AgentApp:
             cost = f'{self.currency}{s.get("cost", 0):.0f} so far' if s["mode"] in ("postpaid", "member") else ""
             bal = f'  ·  balance {self.currency}{s["balance"]:.0f}' if "balance" in s else ""
             self.o_cost.config(text=cost + bal)
-            if s["mode"] in ("member", "postpaid"):
+            can_end = s["mode"] in ("member", "postpaid")
+            if can_end:
                 self.o_end.pack(anchor="w", pady=(6, 0))
+                self.g_end.pack(side="right")
             else:
                 self.o_end.pack_forget()
+                self.g_end.pack_forget()
+            if self.games:
+                self.o_games.pack(anchor="w", pady=(6, 0))
+            else:
+                self.o_games.pack_forget()
+            self.g_title.config(text=f"Hi {s['user']}, choose a game")
+            self.g_info.config(text=self.o_time.cget("text") + ("  ·  " + s["package"] if s.get("package") else ""))
             self.overlay.attributes("-topmost", True)
+            self._place_overlay()
         self.root.after(1000, self._tick)
 
     def run(self):

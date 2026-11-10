@@ -25,6 +25,9 @@ One master PC controls every gaming PC in the cafe. Staff use a browser dashboar
 | **Members** | Accounts with a prepaid balance. Staff can top up, refund and reset passwords. A top-up during a session extends the time straight away. A member can't be logged in on two PCs at once. |
 | **Reports** | Daily cash collected, walk-in sales, member top-ups and usage, sessions and hours played. Downloads as a CSV that opens directly in Excel or Google Sheets. |
 | **Client lock screen** | Full-screen and always on top. Includes member login, a small timer overlay that can be dragged around during play, and warnings at 5 minutes and 1 minute. The PC locks itself when time is up, even if the network drops. |
+| **Game launcher** | When a session starts, the rig shows full-screen tiles for the games installed on it. The customer clicks a tile to play. Staff can also launch a game remotely on one rig or many from the dashboard. |
+| **Rig register** | Records which Steam or EA account is signed in on each rig, which games are installed and hardware notes. Flags rigs that share one account, because those rigs can't play online at the same time. Never stores passwords. |
+| **Packages and group start** | Fixed-price bundles such as "5 hours for ₹250" (charged per rig) or "Race night: 4 rigs × 1 hour for ₹800" (one price, split across the rigs). Tick several rigs and click **Start group** to start them all together, charge once and auto-launch the same game on every rig. **End group** closes them together. |
 | **Resilience** | Running sessions survive a server restart because they are stored in SQLite. Commands are sent to each PC once. |
 
 The only requirement is **Python 3.9 or later**. There is nothing to `pip install`.
@@ -52,6 +55,18 @@ The only requirement is **Python 3.9 or later**. There is nothing to `pip instal
 
 **Testing without shutting PCs down:** run `python agent.py --dry-run`. Shutdown, restart and log off are then printed instead of carried out.
 
+### 3. Games and rigs (one-time)
+1. **Games tab, then + Add game.** Enter the name and the **launch target**:
+   - **Steam games:** in Steam, right-click the game, choose **Manage**, then **Add desktop shortcut**. Open the shortcut's **Properties** and copy the `steam://rungameid/…` link.
+   - **EA app and other games:** use the `.exe` or shortcut path. It must be the same path on every rig.
+2. **PCs tab, then ⋯ on each rig.** Enter the game account signed in on that rig (for example `Steam: rig01_cafe`), tick the installed games and add notes such as "Fanatec DD wheel".
+3. **Packages tab.** Create bundles, for example "Race night 4×1hr" with Rigs set to 4, a price of ₹800 and F1 25 set to auto-launch.
+
+**Racing games (F1 25):**
+- F1 25 has no LAN mode. Multiplayer runs through EA's servers, so each rig needs internet access, **its own EA account and its own copy of the game**.
+- Make all the rig accounts EA friends once. On race night, host a private lobby on one rig and invite the rest.
+- If two rigs share one account, the dashboard shows a ⚠ warning.
+
 ## Daily use
 
 | Situation | Action |
@@ -61,6 +76,7 @@ The only requirement is **Python 3.9 or later**. There is nothing to `pip instal
 | Regular customer | **Members**, then **+ New member**, then **Top up**. The customer logs in on any PC with their username and password |
 | "Pay when I leave" | Start the session as **Pay later**. Clicking **End & bill** shows the amount to collect |
 | Closing time | **Select all**, then **Message** ("Closing in 10 min"), then **Shut down** |
+| Race night for 4 friends | Tick the 4 rigs, click **Start group**, choose the "Race night" package and enter the team name. F1 25 opens on all 4 rigs. Then create a private lobby in-game |
 | End-of-day cash tally | **Reports**, then **Download CSV** |
 
 ## Limits of this version
@@ -73,13 +89,15 @@ The only requirement is **Python 3.9 or later**. There is nothing to `pip instal
 
   Commercial tools such as ggLeap and SENET go further: they replace the Windows shell and add a driver-level keyboard hook.
 - **The lock screen covers only the primary monitor.**
-- **No game launcher, disk restore or remote screen view.** These are the natural next additions (see the roadmap).
+- **The launcher is not a locked-down kiosk.** It covers the desktop and shows only approved games. Once a game is running, a customer can still Alt+Tab to Windows. Combine it with the account restrictions above. Set `"allow_desktop": true` in `agent_config.json` to show a "Desktop" button for staff or home use.
+- **Game logins aren't automated.** Each rig stays signed in to its own Steam/EA account. CafeMaster records which account is on which rig but never stores or enters passwords.
+- **No disk restore or remote screen view.**
 - **Keep it on a trusted LAN.** Traffic is plain HTTP. Don't expose port 8080 to the internet.
 
 ## Roadmap ideas
-1. A game and app launcher on the client that shows only an approved list of games.
-2. Food and drink orders from the PC, with a POS screen on the dashboard.
-3. Happy-hour pricing based on time of day, and discount packages (for example 5 hours for ₹250).
+1. Food and drink orders from the PC, with a POS screen on the dashboard.
+2. Happy-hour pricing based on time of day.
+3. Leaderboards for race nights.
 4. Live screenshots or thumbnails of each PC.
 5. Bundling the agent as a Windows service and a single `.exe` using PyInstaller, so gaming PCs don't need Python.
 6. Multiple staff logins with an audit trail.
@@ -93,6 +111,6 @@ client/agent.py        Gaming-PC agent (tkinter UI + background heartbeat thread
 tests/test_server.py   End-to-end tests: python3 -m unittest discover -s tests
 ```
 
-**Agent protocol:** the agent sends `POST /api/agent/heartbeat {key, pc_id, name, info}` and gets back `{state: locked|active, session, commands[], server_time}`. The agent works out the clock offset between itself and the server from `server_time`, so the countdown stays correct even if the PC's clock is wrong.
+**Agent protocol:** the agent sends `POST /api/agent/heartbeat {key, pc_id, name, info}` and gets back `{state: locked|active, session, commands[], games[], server_time}`. Commands are `message`, `lock`, `launch`, `logoff`, `restart` and `shutdown`. The agent reports game starts with `POST /api/agent/launch` so the daily report can show which games were played. The agent works out the clock offset between itself and the server from `server_time`, so the countdown stays correct even if the PC's clock is wrong.
 
 **Data:** stored in `server/data/` as `cafe.db` and `config.json`. Back up this folder.

@@ -64,6 +64,12 @@ input[type=text],input[type=password],input[type=number],input[type=date],select
 #login{max-width:340px;margin:12vh auto;background:var(--panel);border:1px solid var(--line);padding:24px;border-radius:12px}
 .hide{display:none!important}
 .muted{color:var(--muted)}
+.grp{font-size:11px;padding:1px 7px;border-radius:10px;background:rgba(79,140,255,.15);color:#9dbcff;border:1px solid rgba(79,140,255,.35);margin-left:4px}
+.acct{font-size:12px;color:var(--muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acct.bad{color:var(--amber);white-space:normal}
+.warnbox{background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.45);color:#e3b341;border-radius:8px;padding:8px 10px;font-size:12px;margin:8px 0}
+.checks{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
+.checks label{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--text)}
 .empty{padding:40px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:10px}
 code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break-all}
 @media (max-width:640px){header{padding:10px 16px}main{padding:14px 16px}.kpis{margin-left:0;width:100%}}
@@ -86,6 +92,8 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
   <nav>
     <button data-tab="pcs" class="on">PCs</button>
     <button data-tab="members">Members</button>
+    <button data-tab="games">Games</button>
+    <button data-tab="packages">Packages</button>
     <button data-tab="reports">Reports</button>
     <button data-tab="settings">Settings</button>
   </nav>
@@ -104,6 +112,8 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
       <label class="chip"><input type="checkbox" id="selAll"> Select all</label>
       <span class="muted" id="selCount"></span>
       <span class="sp"></span>
+      <button class="btn pri" id="groupStart">Start group</button>
+      <button class="btn" id="groupLaunch">Launch game</button>
       <button class="btn" data-bulk="message">Message</button>
       <button class="btn" data-bulk="lock">Lock</button>
       <button class="btn danger" data-bulk="restart">Restart</button>
@@ -132,9 +142,36 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
       <button class="btn" id="rCsv">Download CSV (Excel)</button>
     </div>
     <div class="cards" id="rCards"></div>
+    <div id="rGames"></div>
     <h3>Sessions</h3>
-    <table><thead><tr><th>Start</th><th>End</th><th>PC</th><th>User</th><th>Type</th><th>Minutes</th><th>Amount</th><th>Ended by</th></tr></thead>
+    <table><thead><tr><th>Start</th><th>End</th><th>PC</th><th>User</th><th>Type</th><th>Package</th><th>Minutes</th><th>Amount</th><th>Ended by</th></tr></thead>
     <tbody id="rBody"></tbody></table>
+  </section>
+
+  <!-- Games -->
+  <section id="tab-games" class="hide">
+    <div class="bar">
+      <span class="muted">Games shown in the launcher on each rig. Tick which rigs have each game under PCs › ⋯</span>
+      <span class="sp"></span>
+      <button class="btn pri" id="gAdd">+ Add game</button>
+    </div>
+    <table><thead><tr><th>Game</th><th>Category</th><th>Launch target</th><th>Installed on</th><th></th></tr></thead>
+    <tbody id="gBody"></tbody></table>
+    <h3>Rig register</h3>
+    <p class="muted" style="margin-top:-6px">Which game account is signed in on each rig. Never store passwords here.</p>
+    <table><thead><tr><th>Rig</th><th>Game account</th><th>Games</th><th>Notes</th></tr></thead>
+    <tbody id="regBody"></tbody></table>
+  </section>
+
+  <!-- Packages -->
+  <section id="tab-packages" class="hide">
+    <div class="bar">
+      <span class="muted">Fixed-price bundles. "Rigs" &gt; 1 = one price for the whole group (e.g. race night), split across the rigs.</span>
+      <span class="sp"></span>
+      <button class="btn pri" id="pAdd">+ New package</button>
+    </div>
+    <table><thead><tr><th>Package</th><th>Time</th><th>Rigs</th><th>Price</th><th>Per rig / hr</th><th>Auto-launch</th><th></th></tr></thead>
+    <tbody id="pBody"></tbody></table>
   </section>
 
   <!-- Settings -->
@@ -201,12 +238,15 @@ $$('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.tab==='members') loadMembers();
   if (b.dataset.tab==='reports') loadReport();
   if (b.dataset.tab==='settings') loadSettings();
+  if (b.dataset.tab==='games') renderGames();
+  if (b.dataset.tab==='packages') renderPackages();
 });
 
 // ---------- PCs ----------
 async function refresh(){
   if (!token) return;
-  try { state = await api('/state'); clockOffset = state.server_time - Date.now()/1000; render() }
+  try { state = await api('/state'); clockOffset = state.server_time - Date.now()/1000; render();
+    if (!$('#tab-games').classList.contains('hide')) renderGames(); if (!$('#tab-packages').classList.contains('hide')) renderPackages() }
   catch(e){ if (token) console.warn(e) }
 }
 function render(){
@@ -230,12 +270,14 @@ function pcCard(p){
     if (s.ends){ const rem = s.ends - nowS; timer = fmtDur(rem); if (rem < 300) cls += ' warn' }
     else timer = fmtDur(nowS - s.started);
     const modeTxt = {prepaid:'Prepaid', postpaid:'Pay later', member:'Member', free:'Free'}[s.mode];
-    sub = `${esc(s.user)} · ${modeTxt} · ${s.ends ? 'left' : 'elapsed'} · ${money(s.cost)}`;
+    sub = `${esc(s.user)} · ${s.package ? esc(s.package) : modeTxt} · ${s.ends ? 'left' : 'elapsed'} · ${money(s.cost)}`;
   } else sub = p.online ? `${money(p.rate)}/hr · ${esc(p.ip)}` : (p.last_seen ? 'Last seen '+fmtTime(p.last_seen) : 'Never connected');
   const a = [];
   if (s){
     if (s.mode==='prepaid') a.push(`<button class="btn sm" onclick="addTimeModal('${p.id}')">+ Time</button>`);
-    a.push(`<button class="btn sm ok" onclick="endSession('${p.id}')">End & bill</button>`);
+    if (s.group_id) a.push(`<button class="btn sm ok" onclick="endGroup('${s.group_id}')">End group</button>`);
+    else a.push(`<button class="btn sm ok" onclick="endSession('${p.id}')">End & bill</button>`);
+    if (launchable(p).length) a.push(`<button class="btn sm" onclick="launchModal(['${p.id}'])">▶ Game</button>`);
   } else a.push(`<button class="btn sm pri" onclick="startModal('${p.id}')">Start</button>`);
   a.push(`<button class="btn sm" onclick="msgModal(['${p.id}'])">Msg</button>`);
   a.push(`<button class="btn sm" onclick="pcModal('${p.id}')">⋯</button>`);
@@ -243,9 +285,20 @@ function pcCard(p){
     <div class="pc-h"><input type="checkbox" ${selected.has(p.id)?'checked':''} onchange="toggleSel('${p.id}',this.checked)">
       <span class="pc-name">${esc(p.name)}</span><span class="tag">${esc(p.group)}</span>
       <span class="st">${labels[p.status]}</span></div>
-    <div class="timer">${timer}</div><div class="sub">${sub}</div>
+    <div class="timer">${timer}${s && s.group_id ? `<span class="grp">${esc(groupName(s))}</span>` : ''}</div><div class="sub">${sub}</div>
+    ${acctLine(p)}
     <div class="acts">${a.join('')}</div></div>`;
 }
+const gameById = id => state.games.find(g=>g.id===id);
+const launchable = p => state.games.filter(g => p.games.includes(g.id) && g.launch);
+const groupName = s => { const n = state.pcs.filter(x=>x.session && x.session.group_id===s.group_id).length; return `${s.user} ×${n}` };
+function acctLine(p){
+  const games = p.games.map(gameById).filter(Boolean).map(g=>g.name);
+  if (!p.account && !games.length) return `<div class="acct">No game account set · <a href="#" style="color:var(--accent)" onclick="pcModal('${p.id}');return false">set up</a></div>`;
+  const clash = p.shares_account_with.length ? ` ⚠ same account as ${esc(p.shares_account_with.join(', '))}` : '';
+  return `<div class="acct ${clash?'bad':''}" title="${esc(games.join(', '))}">🎮 ${esc(p.account||'no account')} · ${games.length} game${games.length===1?'':'s'}${clash}</div>`;
+}
+function warnToast(r){ if (r && r.warnings && r.warnings.length) setTimeout(()=>toast('⚠ '+r.warnings.join(' · '), true), 400) }
 function toggleSel(id,on){ on?selected.add(id):selected.delete(id); render() }
 $('#selAll').onchange = e => { selected = new Set(e.target.checked ? state.pcs.map(p=>p.id) : []); render() };
 $$('[data-bulk]').forEach(b => b.onclick = () => {
@@ -268,26 +321,33 @@ function startModal(id){
   modal(`<h3>Start session · ${esc(p.name)}</h3>
   <div class="row"><label>Type</label><div class="chips" id="modeChips">
     <span class="chip on" data-m="prepaid">Prepaid</span><span class="chip" data-m="postpaid">Pay later</span>
-    <span class="chip" data-m="member">Member</span><span class="chip" data-m="free">Free / staff</span></div></div>
+    <span class="chip" data-m="member">Member</span><span class="chip" data-m="free">Free / staff</span>
+    ${singlePkgs().length?'<span class="chip" data-m="package">Package</span>':''}</div></div>
+  <div id="mPkg" class="hide"><div class="row"><label>Package</label><select id="pkg">${singlePkgs().map(k=>`<option value="${k.id}">${esc(k.name)} · ${fmtMin(k.minutes)} · ${money(k.price)}</option>`).join('')}</select></div></div>
   <div id="mPre"><div class="row"><label>Minutes</label><div class="chips" id="minChips">
     ${[30,60,90,120,180,300].map(m=>`<span class="chip ${m===60?'on':''}" data-v="${m}">${m>=60?(m/60)+' hr':m+' min'}</span>`).join('')}</div>
     <input type="number" id="minutes" value="60" min="1" style="margin-top:6px"></div>
     <div class="row"><label>Payment</label><select id="method"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select></div></div>
   <div id="mMem" class="hide"><div class="row"><label>Member username</label><input type="text" id="mUser"></div></div>
   <div class="row" id="mLabelRow"><label>Customer name (optional)</label><input type="text" id="label"></div>
+  ${gameSelect(launchable(p))}
   <div class="sub" id="price"></div>
   <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Start</button></div>`);
   let mode='prepaid';
   const upd = () => { const m = +$('#minutes').value||0;
     $('#price').textContent = mode==='prepaid' ? `Collect ${money(p.rate*m/60)} now (${money(p.rate)}/hr)` :
-      mode==='postpaid' ? `Billed at ${money(p.rate)}/hr when the session ends` : mode==='member' ? 'Deducted from member balance' : 'No charge' };
+      mode==='postpaid' ? `Billed at ${money(p.rate)}/hr when the session ends` : mode==='member' ? 'Deducted from member balance' :
+      mode==='package' ? `Collect ${money((state.packages.find(k=>k.id==$('#pkg').value)||{}).price)} now` : 'No charge' };
   $$('#modeChips .chip').forEach(c => c.onclick = () => { mode=c.dataset.m; $$('#modeChips .chip').forEach(x=>x.classList.toggle('on',x===c));
-    $('#mPre').classList.toggle('hide', mode!=='prepaid'); $('#mMem').classList.toggle('hide', mode!=='member');
+    $('#mPre').classList.toggle('hide', mode!=='prepaid' && mode!=='package'); $('#mMem').classList.toggle('hide', mode!=='member');
+    $('#mPkg').classList.toggle('hide', mode!=='package'); $('#mPre .row').classList.toggle('hide', mode==='package');
     $('#mLabelRow').classList.toggle('hide', mode==='member'); upd() });
   $$('#minChips .chip').forEach(c => c.onclick = () => { $('#minutes').value=c.dataset.v; $$('#minChips .chip').forEach(x=>x.classList.toggle('on',x===c)); upd() });
-  $('#minutes').oninput = upd; upd();
+  $('#minutes').oninput = upd; if ($('#pkg')) $('#pkg').onchange = upd; upd();
   $('#go').onclick = async () => { const r = await act(()=>api(`/pc/${id}/start`, {body:{mode, minutes:+$('#minutes').value,
-      username: $('#mUser').value, label: $('#label').value, method: $('#method').value}}), `Started on ${p.name}`); if (r) closeModal() };
+      username: $('#mUser').value, label: $('#label').value, method: $('#method').value,
+      package_id: $('#pkg') ? +$('#pkg').value : null, game_id: +$('#game').value || null}}), `Started on ${p.name}`);
+    if (r){ closeModal(); warnToast(r) } };
 }
 function addTimeModal(id){
   const p = pcById(id);
@@ -332,6 +392,10 @@ function pcModal(id){
   modal(`<h3>${esc(p.name)}</h3>
   <div class="row"><label>Display name</label><input type="text" id="pName" value="${esc(p.name)}"></div>
   <div class="row"><label>Rate group</label><select id="pGrp">${groups}</select></div>
+  <div class="row"><label>Game account signed in on this rig (no passwords)</label><input type="text" id="pAcct" value="${esc(p.account)}" placeholder="e.g. Steam: rig01_cafe / EA: rig01@…"></div>
+  ${p.shares_account_with.length?`<div class="warnbox">Same account as ${esc(p.shares_account_with.join(', '))}. Steam/EA allow one active session per account, so these rigs can't play online at the same time.</div>`:''}
+  <div class="row"><label>Installed games</label><div class="checks">${state.games.map(g=>`<label><input type="checkbox" class="pg" value="${g.id}" ${p.games.includes(g.id)?'checked':''}>${esc(g.name)}</label>`).join('') || '<span class="muted">Add games in the Games tab first</span>'}</div></div>
+  <div class="row"><label>Notes (hardware, wheel, seat…)</label><input type="text" id="pNotes" value="${esc(p.notes)}"></div>
   <div class="sub">ID ${esc(p.id)} · ${esc(p.ip)} · ${esc(p.info.os||'')} ${p.info.user?'· Windows user '+esc(p.info.user):''}</div>
   <div class="acts" style="margin-top:12px">
     <button class="btn" onclick="cmd('${id}','lock')">Lock</button>
@@ -341,7 +405,8 @@ function pcModal(id){
     <button class="btn danger" onclick="delPc('${id}')">Remove</button>
   </div>
   <div class="foot"><button class="btn" onclick="closeModal()">Close</button><button class="btn pri" id="go">Save</button></div>`);
-  $('#go').onclick = async () => { const r = await act(()=>api(`/pc/${id}/update`, {body:{name:$('#pName').value, group:$('#pGrp').value}}), 'Saved'); if (r) closeModal() };
+  $('#go').onclick = async () => { const r = await act(()=>api(`/pc/${id}/update`, {body:{name:$('#pName').value, group:$('#pGrp').value,
+     account:$('#pAcct').value, notes:$('#pNotes').value, games:$$('.pg:checked').map(c=>+c.value)}}), 'Saved'); if (r) closeModal() };
 }
 async function cmd(id, type){
   if (type!=='lock' && !confirm(`${type} ${pcById(id).name}?`)) return;
@@ -349,6 +414,132 @@ async function cmd(id, type){
   if (r){ closeModal(); if (r.bill) showBill(pcById(id)?.name||id, r.bill) }
 }
 async function delPc(id){ if (confirm('Remove this PC from the list? It will re-appear if its agent connects again.')) { await act(()=>api(`/pc/${id}`,{method:'DELETE'}), 'Removed'); closeModal() } }
+
+// ---------- games launch / group start ----------
+const fmtMin = m => m % 60 ? (m >= 60 ? `${Math.floor(m/60)} hr ${m%60} min` : `${m} min`) : `${m/60} hr`;
+const singlePkgs = () => state.packages.filter(k=>k.rigs===1);
+function gameSelect(games, label='Launch a game on start (optional)'){
+  return `<div class="row"><label>${label}</label><select id="game"><option value="">— none —</option>${
+    games.map(g=>`<option value="${g.id}">${esc(g.name)}</option>`).join('')}</select></div>`;
+}
+function launchModal(ids){
+  ids = ids || [...selected];
+  const pcs = ids.map(pcById).filter(p=>p && p.session);
+  if (!pcs.length) return toast('Select rigs that have a running session', true);
+  const games = state.games.filter(g=>g.launch && pcs.some(p=>p.games.includes(g.id)));
+  if (!games.length) return toast('No launchable games on these rigs. Set them up in the Games tab.', true);
+  modal(`<h3>Launch game on ${pcs.length===1?esc(pcs[0].name):pcs.length+' rigs'}</h3>${gameSelect(games,'Game')}<div id="cov" class="sub"></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Launch</button></div>`);
+  $('#game').value = games[0].id;
+  const cov = () => { const g=+$('#game').value, miss=pcs.filter(p=>!p.games.includes(g)).map(p=>p.name);
+    $('#cov').innerHTML = miss.length ? `<div class="warnbox">Not installed on ${esc(miss.join(', '))} — they will be skipped.</div>` : '' };
+  $('#game').onchange = cov; cov();
+  $('#go').onclick = async () => { const g=+$('#game').value, target=pcs.filter(p=>p.games.includes(g)).map(p=>p.id);
+    const r = await act(()=>api('/bulk',{body:{type:'launch', game_id:g, ids:target}}), `Launching on ${target.length} rig(s)`); if (r) closeModal() };
+}
+$('#groupLaunch').onclick = () => launchModal();
+$('#groupStart').onclick = () => {
+  const pcs = [...selected].map(pcById).filter(p=>p && !p.session);
+  if (!pcs.length) return toast('Tick the free rigs you want to start together', true);
+  const pk = state.packages;
+  modal(`<h3>Start group · ${pcs.length} rig${pcs.length>1?'s':''}</h3>
+  <div class="sub" style="margin-bottom:10px">${esc(pcs.map(p=>p.name).join(', '))}</div>
+  <div class="row"><label>Package</label><select id="gpkg"><option value="">Custom time (hourly rate per rig)</option>${
+    pk.map(k=>`<option value="${k.id}" ${k.rigs>1&&k.rigs!==pcs.length?'disabled':''}>${esc(k.name)} · ${fmtMin(k.minutes)} · ${money(k.price)}${k.rigs>1?` for ${k.rigs} rigs`:' per rig'}</option>`).join('')}</select></div>
+  <div class="row" id="gminRow"><label>Minutes per rig</label><input type="number" id="gmin" value="60" min="1"></div>
+  <div class="row"><label>Team / customer name</label><input type="text" id="glabel" placeholder="e.g. Team Apex"></div>
+  ${gameSelect(state.games.filter(g=>g.launch), 'Launch on all rigs')}
+  <div class="row"><label>Payment</label><select id="method"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select></div>
+  <div id="gwarn"></div><div class="sub" id="price"></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Start ${pcs.length} rig${pcs.length>1?'s':''}</button></div>`);
+  const upd = () => {
+    const k = pk.find(x=>x.id==$('#gpkg').value);
+    $('#gminRow').classList.toggle('hide', !!k);
+    if (k && k.game_id && !$('#game').dataset.touched) $('#game').value = k.game_id;
+    const total = k ? (k.rigs>1 ? k.price : k.price*pcs.length) : pcs.reduce((a,p)=>a+p.rate*(+$('#gmin').value||0)/60, 0);
+    $('#price').textContent = `Collect ${money(total)} now`;
+    const g = +$('#game').value, w = [];
+    if (g){ const miss = pcs.filter(p=>!p.games.includes(g)).map(p=>p.name); if (miss.length) w.push(`${gameById(g).name} is not marked installed on ${miss.join(', ')}.`) }
+    const accs = {}; pcs.forEach(p=>{ const a=p.account.trim().toLowerCase(); if(a){ (accs[a]=accs[a]||[]).push(p.name) } });
+    Object.values(accs).filter(v=>v.length>1).forEach(v=>w.push(`${v.join(' & ')} share one game account — only one can play online.`));
+    $('#gwarn').innerHTML = w.map(x=>`<div class="warnbox">${esc(x)}</div>`).join('');
+  };
+  $('#gpkg').onchange = upd; $('#gmin').oninput = upd; $('#game').onchange = e => { e.target.dataset.touched=1; upd() }; upd();
+  $('#go').onclick = async () => {
+    const r = await act(()=>api('/group/start', {body:{ids:pcs.map(p=>p.id), package_id:+$('#gpkg').value||null,
+      minutes:+$('#gmin').value, label:$('#glabel').value, method:$('#method').value, game_id:+$('#game').value||null}}),
+      `Started ${pcs.length} rig(s)`);
+    if (r){ closeModal(); selected.clear(); warnToast(r) }
+  };
+};
+async function endGroup(gid){
+  const pcs = state.pcs.filter(p=>p.session && p.session.group_id===gid);
+  if (!confirm(`End the group session on ${pcs.map(p=>p.name).join(', ')}?`)) return;
+  const r = await act(()=>api(`/group/${gid}/end`, {body:{}}));
+  if (r) modal(`<h3>Group ended</h3><table><tbody><tr><td>Rigs</td><td>${r.rigs}</td></tr>
+    <tr><td>Total charged</td><td>${money(r.amount)}</td></tr><tr><td><b>Collect now</b></td><td><b style="font-size:20px">${money(r.due)}</b></td></tr></tbody></table>
+    <div class="foot"><button class="btn pri" onclick="closeModal()">Done</button></div>`);
+}
+
+// ---------- games tab ----------
+function renderGames(){
+  if (!state) return;
+  $('#gBody').innerHTML = state.games.length ? state.games.map(g=>{
+    const on = state.pcs.filter(p=>p.games.includes(g.id)).map(p=>p.name);
+    return `<tr><td><b>${esc(g.name)}</b>${g.max_players?` <span class="muted">· up to ${g.max_players}</span>`:''}</td><td>${esc(g.category)}</td>
+      <td>${g.launch?`<code>${esc(g.launch)}</code>`:'<span class="acct bad">⚠ not set — launcher hides it</span>'}</td>
+      <td>${on.length?esc(on.join(', ')):'<span class="muted">no rigs</span>'}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn sm" onclick="gameModal(${g.id})">Edit</button>
+      <button class="btn sm danger" onclick="delGame(${g.id})">Delete</button></td></tr>`}).join('')
+    : `<tr><td colspan="5" class="muted" style="text-align:center;padding:24px">No games yet</td></tr>`;
+  $('#regBody').innerHTML = state.pcs.map(p=>`<tr><td><a href="#" style="color:var(--accent)" onclick="pcModal('${p.id}');return false">${esc(p.name)}</a></td>
+    <td class="${p.shares_account_with.length?'acct bad':''}">${esc(p.account)||'<span class="muted">—</span>'}${p.shares_account_with.length?' ⚠ shared':''}</td>
+    <td>${esc(p.games.map(gameById).filter(Boolean).map(g=>g.name).join(', '))||'<span class="muted">—</span>'}</td><td>${esc(p.notes)}</td></tr>`).join('')
+    || `<tr><td colspan="4" class="muted" style="text-align:center;padding:24px">No rigs connected yet</td></tr>`;
+}
+function gameModal(id){
+  const g = id ? gameById(id) : {name:'', launch:'', category:'', max_players:''};
+  modal(`<h3>${id?'Edit':'Add'} game</h3>
+  <div class="row"><label>Name</label><input type="text" id="gn" value="${esc(g.name)}"></div>
+  <div class="row"><label>Launch target</label><input type="text" id="gl" value="${esc(g.launch)}" placeholder="steam://rungameid/APPID  or  C:\\Games\\game.exe">
+   <span class="muted" style="font-size:12px">Steam: right-click game › Manage › Add desktop shortcut, open its Properties, copy the <code>steam://rungameid/…</code> URL. EA app/others: the .exe or shortcut path (same on every rig).</span></div>
+  <div class="row"><label>Category</label><input type="text" id="gc" value="${esc(g.category)}" placeholder="Racing, FPS…"></div>
+  <div class="row"><label>Max players (info only)</label><input type="number" id="gm" value="${esc(g.max_players)}" min="0"></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Save</button></div>`);
+  $('#go').onclick = async () => { const r = await act(()=>api('/games',{body:{id, name:$('#gn').value, launch:$('#gl').value,
+     category:$('#gc').value, max_players:+$('#gm').value}}), 'Game saved'); if (r){ closeModal(); renderGames() } };
+}
+$('#gAdd').onclick = () => gameModal(null);
+async function delGame(id){ if (confirm(`Delete ${gameById(id).name}? It is removed from all rigs and packages.`)) { await act(()=>api(`/games/${id}`,{method:'DELETE'}), 'Deleted'); renderGames() } }
+
+// ---------- packages tab ----------
+function renderPackages(){
+  if (!state) return;
+  $('#pBody').innerHTML = state.packages.length ? state.packages.map(k=>`<tr><td><b>${esc(k.name)}</b></td><td>${fmtMin(k.minutes)}</td>
+    <td>${k.rigs>1?k.rigs+' (group)':'1 (per rig)'}</td><td>${money(k.price)}</td><td>${money(k.price/k.rigs/(k.minutes/60))}</td>
+    <td>${esc(k.game_name||'—')}</td><td style="text-align:right;white-space:nowrap"><button class="btn sm" onclick="pkgModal(${k.id})">Edit</button>
+    <button class="btn sm danger" onclick="delPkg(${k.id})">Delete</button></td></tr>`).join('')
+    : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">No packages yet — e.g. "5 hours for ₹250" or "Race night: 4 rigs × 1 hr"</td></tr>`;
+}
+function pkgModal(id){
+  const k = id ? state.packages.find(x=>x.id===id) : {name:'', minutes:60, price:'', rigs:1, game_id:null};
+  modal(`<h3>${id?'Edit':'New'} package</h3>
+  <div class="row"><label>Name</label><input type="text" id="kn" value="${esc(k.name)}" placeholder="Race night 4×1hr"></div>
+  <div class="row"><label>Minutes per rig</label><input type="number" id="km" value="${k.minutes}" min="1"></div>
+  <div class="row"><label>Rigs — 1 = price per rig; 2+ = one price for exactly that many rigs</label><input type="number" id="kr" value="${k.rigs}" min="1"></div>
+  <div class="row"><label>Price (${esc(cur())})</label><input type="number" id="kp" value="${k.price}" min="0"></div>
+  ${gameSelect(state.games.filter(g=>g.launch), 'Auto-launch game (optional)')}
+  <div class="sub" id="kinfo"></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Save</button></div>`);
+  $('#game').value = k.game_id || '';
+  const info = () => { const m=+$('#km').value||1, r=+$('#kr').value||1, pr=+$('#kp').value||0;
+    $('#kinfo').textContent = `= ${money(pr/r/(m/60))} per rig-hour`; };
+  ['#km','#kr','#kp'].forEach(x=>$(x).oninput=info); info();
+  $('#go').onclick = async () => { const r = await act(()=>api('/packages',{body:{id, name:$('#kn').value, minutes:+$('#km').value,
+     rigs:+$('#kr').value, price:+$('#kp').value, game_id:+$('#game').value||null}}), 'Package saved'); if (r){ closeModal(); renderPackages() } };
+}
+$('#pAdd').onclick = () => pkgModal(null);
+async function delPkg(id){ if (confirm('Delete this package? Past sales stay in reports.')) { await act(()=>api(`/packages/${id}`,{method:'DELETE'}), 'Deleted'); renderPackages() } }
 
 // ---------- members ----------
 let mTimer;
@@ -403,12 +594,15 @@ async function loadReport(){
   try { const r = await api('/report?date='+$('#rDate').value), t = r.totals;
     $('#rCards').innerHTML = [['Cash collected', money(t.cash_collected)], ['Walk-in sales', money(t.walkin_sales)],
       ['Member top-ups', money(t.member_topups)], ['Member usage', money(t.member_usage)],
-      ['Sessions', t.sessions], ['Hours played', t.hours_played]].map(([k,v])=>`<div class="card"><small>${k}</small><b>${v}</b></div>`).join('');
+      ['Sessions', t.sessions], ['Hours played', t.hours_played], ['Package sales', money(t.package_sales)],
+      ['Group bookings', t.group_bookings]].map(([k,v])=>`<div class="card"><small>${k}</small><b>${v}</b></div>`).join('');
+    $('#rGames').innerHTML = r.top_games.length ? `<h3>Games played</h3><table style="margin-bottom:16px"><thead><tr><th>Game</th><th>Launches</th><th>Rigs</th></tr></thead><tbody>${
+      r.top_games.map(g=>`<tr><td>${esc(g.name)}</td><td>${g.launches}</td><td>${g.rigs}</td></tr>`).join('')}</tbody></table>` : '';
     const reason = {staff:'Staff', time_up:'Time up', user_logout:'User', locked_by_staff:'Staff lock', shutdown:'Shutdown', restart:'Restart', logoff:'Log off'};
     $('#rBody').innerHTML = r.sessions.length ? r.sessions.map(s=>`<tr><td>${fmtTime(s.started)}</td><td>${s.ended?fmtTime(s.ended):'<i>running</i>'}</td>
-      <td>${esc(s.pc_name)}</td><td>${esc(s.user_label)}</td><td>${esc(s.mode)}</td><td>${s.minutes!=null?Math.round(s.minutes):''}</td>
+      <td>${esc(s.pc_name)}</td><td>${esc(s.user_label)}</td><td>${esc(s.mode)}</td><td>${esc(s.package||'')}</td><td>${s.minutes!=null?Math.round(s.minutes):''}</td>
       <td>${money(s.ended ? s.amount : s.prepaid)}</td><td>${esc(reason[s.end_reason]||s.end_reason||'')}</td></tr>`).join('')
-      : `<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No sessions on this day</td></tr>`;
+      : `<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">No sessions on this day</td></tr>`;
   } catch(e){ toast(e.message, true) }
 }
 

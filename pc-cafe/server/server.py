@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OFFLINE_AFTER = 10          # seconds without heartbeat => PC shown offline
-VALID_COMMANDS = {"message", "shutdown", "restart", "lock", "logoff"}
+VALID_COMMANDS = {"message", "shutdown", "restart", "lock", "logoff", "launch"}
 
 DEFAULT_CONFIG = {
     "cafe_name": "CafeMaster Gaming",
@@ -124,8 +124,30 @@ class Cafe:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT,
                 member_id INTEGER, session_id INTEGER, pc_id TEXT, amount REAL,
                 method TEXT, note TEXT);
+            CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, launch TEXT,
+                category TEXT, max_players INTEGER, sort INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, minutes INTEGER,
+                price REAL, rigs INTEGER DEFAULT 1, game_id INTEGER, active INTEGER DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS game_launches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, pc_id TEXT,
+                game_id INTEGER, game_name TEXT, session_id INTEGER);
             """
         )
+        # migrations for databases created by v1
+        for table, col, decl in (("pcs", "account", "TEXT DEFAULT ''"),
+                                 ("pcs", "notes", "TEXT DEFAULT ''"),
+                                 ("pcs", "games", "TEXT DEFAULT '[]'"),
+                                 ("sessions", "group_id", "TEXT"),
+                                 ("sessions", "package", "TEXT")):
+            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        if not self.db.execute("SELECT 1 FROM games LIMIT 1").fetchone():
+            # starter entry; staff fill in the launch target from the Games tab
+            self.db.execute("INSERT INTO games (name, launch, category, max_players) VALUES (?,?,?,?)",
+                            ("F1 25", "", "Racing", 20))
         self.db.commit()
 
     # ---- config -------------------------------------------------------------
@@ -195,7 +217,8 @@ class Cafe:
             raise ApiError(404, "Unknown PC")
         return row
 
-    def start_session(self, pc_id, mode, minutes=None, member_id=None, label=None, method="cash"):
+    def start_session(self, pc_id, mode, minutes=None, member_id=None, label=None, method="cash",
+                      price=None, group_id=None, package=None, commit=True):
         with self.lock:
             pc = self._pc(pc_id)
             if self.active_session(pc_id):
@@ -208,7 +231,7 @@ class Cafe:
                 if minutes <= 0:
                     raise ApiError(400, "Enter the number of minutes")
                 ends = t + minutes * 60
-                prepaid = self.cost(rate, minutes)
+                prepaid = self.cost(rate, minutes) if price is None else round(float(price), 2)
                 label = label or "Walk-in"
             elif mode == "postpaid":
                 label = label or "Walk-in"
@@ -229,14 +252,88 @@ class Cafe:
             else:
                 raise ApiError(400, "Unknown session type")
             cur = self.db.execute(
-                "INSERT INTO sessions (pc_id, pc_name, member_id, user_label, mode, rate, started, ends, prepaid)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (pc_id, pc["name"], member_id, label, mode, rate, t, ends, prepaid))
+                "INSERT INTO sessions (pc_id, pc_name, member_id, user_label, mode, rate, started, ends,"
+                " prepaid, group_id, package) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (pc_id, pc["name"], member_id, label, mode, rate, t, ends, prepaid, group_id, package))
             if prepaid:
-                self._txn("session_prepaid", prepaid, session_id=cur.lastrowid, pc_id=pc_id,
-                          method=method, note=f"{minutes} min on {pc['name']}")
-            self.db.commit()
+                self._txn("session_prepaid", prepaid, session_id=cur.lastrowid, pc_id=pc_id, method=method,
+                          note=f"{package + ' · ' if package else ''}{minutes} min on {pc['name']}")
+            if commit:
+                self.db.commit()
             return cur.lastrowid
+
+    def start_group(self, pc_ids, package_id=None, minutes=None, label=None, method="cash", game_id=None):
+        """Start prepaid sessions on several rigs at once (race night, team booking).
+
+        With a package: rigs>1 means the package price covers exactly that many rigs and is
+        split across them; rigs==1 means the package price is charged per rig.
+        Without a package: per-rig hourly rate for `minutes`.
+        All-or-nothing: if any rig is busy or unknown, nothing is started or charged.
+        """
+        pc_ids = list(dict.fromkeys(pc_ids or []))
+        if not pc_ids:
+            raise ApiError(400, "Select at least one PC")
+        with self.lock:
+            pkg = None
+            if package_id:
+                pkg = self.db.execute("SELECT * FROM packages WHERE id=? AND active=1",
+                                      (package_id,)).fetchone()
+                if not pkg:
+                    raise ApiError(404, "Package not found")
+                if pkg["rigs"] > 1 and len(pc_ids) != pkg["rigs"]:
+                    raise ApiError(400, f"'{pkg['name']}' is for exactly {pkg['rigs']} rigs; "
+                                        f"{len(pc_ids)} selected")
+                minutes = pkg["minutes"]
+                game_id = game_id or pkg["game_id"]
+            minutes = int(minutes or 0)
+            if minutes <= 0:
+                raise ApiError(400, "Enter the number of minutes")
+            busy = [self._pc(p)["name"] for p in pc_ids if self.active_session(p)]
+            if busy:
+                raise ApiError(409, "Already in use: " + ", ".join(busy))
+            game = self._game(game_id) if game_id else None
+            prices = [None] * len(pc_ids)
+            if pkg:
+                if pkg["rigs"] > 1:   # split total, put rounding remainder on the first rig
+                    share = math.floor(pkg["price"] / len(pc_ids) * 100) / 100
+                    prices = [share] * len(pc_ids)
+                    prices[0] = round(pkg["price"] - share * (len(pc_ids) - 1), 2)
+                else:
+                    prices = [pkg["price"]] * len(pc_ids)
+            group_id = secrets.token_hex(4) if len(pc_ids) > 1 else None
+            label = (label or "").strip()[:40] or ("Group" if group_id else "Walk-in")
+            try:
+                for pc_id, price in zip(pc_ids, prices):
+                    self.start_session(pc_id, "prepaid", minutes, label=label, method=method, price=price,
+                                       group_id=group_id, package=pkg["name"] if pkg else None, commit=False)
+            except Exception:
+                self.db.rollback()
+                raise
+            self.db.commit()
+            warnings = []
+            if game:
+                missing = [self._pc(p)["name"] for p in pc_ids if game["id"] not in self.pc_games(p)]
+                if missing:
+                    warnings.append(f"{game['name']} is not marked installed on: {', '.join(missing)}")
+                if game["launch"]:
+                    for p in pc_ids:
+                        self.queue_command(p, {"type": "launch", "game_id": game["id"]})
+                else:
+                    warnings.append(f"{game['name']} has no launch target yet - set it in the Games tab")
+            warnings += self.account_conflicts(pc_ids)
+            total = sum(p if p is not None else self.cost(self.rate_for(self._pc(i)["grp"]), minutes)
+                        for i, p in zip(pc_ids, prices))
+            return {"group_id": group_id, "total": round(total, 2), "warnings": warnings}
+
+    def end_group(self, group_id):
+        with self.lock:
+            rows = self.db.execute("SELECT pc_id FROM sessions WHERE group_id=? AND ended IS NULL",
+                                   (group_id,)).fetchall()
+            if not rows:
+                raise ApiError(409, "No running sessions in this group")
+            bills = [self.end_session(r["pc_id"]) for r in rows]
+            return {"rigs": len(bills), "amount": round(sum(b["amount"] for b in bills), 2),
+                    "due": round(sum(b.get("due", 0) for b in bills), 2)}
 
     def add_time(self, pc_id, minutes, method="cash"):
         with self.lock:
@@ -323,7 +420,8 @@ class Cafe:
         elapsed = t - s["started"]
         out = {"id": s["id"], "mode": s["mode"], "user": s["user_label"], "rate": s["rate"],
                "started": s["started"], "ends": s["ends"], "elapsed": int(elapsed),
-               "remaining": int(s["ends"] - t) if s["ends"] else None}
+               "remaining": int(s["ends"] - t) if s["ends"] else None,
+               "group_id": s["group_id"], "package": s["package"]}
         if s["mode"] == "prepaid":
             out["cost"] = s["prepaid"]
         elif s["mode"] == "free":
@@ -349,11 +447,19 @@ class Cafe:
         live["commands"].append(cmd)
         live["commands"] = live["commands"][-20:]
 
-    def command(self, pc_id, ctype, text=None):
+    def command(self, pc_id, ctype, text=None, game_id=None):
         if ctype not in VALID_COMMANDS:
             raise ApiError(400, "Unknown command")
         with self.lock:
             self._pc(pc_id)
+            if ctype == "launch":
+                game = self._game(game_id)
+                if not self.active_session(pc_id):
+                    raise ApiError(409, "Start a session before launching a game")
+                if not game["launch"]:
+                    raise ApiError(400, f"Set a launch target for {game['name']} in the Games tab")
+                self.queue_command(pc_id, {"type": "launch", "game_id": game["id"]})
+                return None
             if ctype == "lock":
                 if self.active_session(pc_id):
                     return self.end_session(pc_id, reason="locked_by_staff")
@@ -387,6 +493,7 @@ class Cafe:
                 "rate": self.rate_for(row["grp"]),
                 "server_time": now(), "state": "active" if s else "locked",
                 "session": s, "commands": commands,
+                "games": self.games_for_pc(pc_id),
             }
 
     def update_pc(self, pc_id, data):
@@ -400,6 +507,14 @@ class Cafe:
                 if self.active_session(pc_id):
                     raise ApiError(409, "End the running session before changing the group")
                 self.db.execute("UPDATE pcs SET grp=? WHERE id=?", (data["group"], pc_id))
+            if "account" in data:
+                self.db.execute("UPDATE pcs SET account=? WHERE id=?", (str(data["account"]).strip()[:80], pc_id))
+            if "notes" in data:
+                self.db.execute("UPDATE pcs SET notes=? WHERE id=?", (str(data["notes"]).strip()[:300], pc_id))
+            if "games" in data:
+                valid = {r["id"] for r in self.db.execute("SELECT id FROM games")}
+                ids = sorted({int(g) for g in data["games"] if int(g) in valid})
+                self.db.execute("UPDATE pcs SET games=? WHERE id=?", (json.dumps(ids), pc_id))
             self.db.commit()
 
     def delete_pc(self, pc_id):
@@ -423,10 +538,129 @@ class Cafe:
                     "rate": self.rate_for(row["grp"]), "online": online, "ip": live.get("ip", ""),
                     "info": live.get("info", {}), "last_seen": live.get("last_seen"),
                     "status": ("in_use" if s else "idle") if online else ("in_use_offline" if s else "offline"),
-                    "session": s,
+                    "session": s, "account": row["account"] or "", "notes": row["notes"] or "",
+                    "games": self.pc_games(row["id"]),
                 })
+            by_account = {}
+            for p in pcs:
+                key = p["account"].strip().lower()
+                if key:
+                    by_account.setdefault(key, []).append(p["name"])
+            for p in pcs:
+                others = [n for n in by_account.get(p["account"].strip().lower(), []) if n != p["name"]]
+                p["shares_account_with"] = others
             return {"server_time": t, "settings": self.public_settings(), "pcs": pcs,
+                    "games": self.list_games(), "packages": self.list_packages(),
                     "today": self.report(dt.date.today().isoformat())["totals"]}
+
+    # ---- games catalogue & rig register ---------------------------------------
+    def _game(self, game_id):
+        try:
+            row = self.db.execute("SELECT * FROM games WHERE id=?", (int(game_id),)).fetchone()
+        except (TypeError, ValueError):
+            row = None
+        if not row:
+            raise ApiError(404, "Game not found")
+        return row
+
+    def pc_games(self, pc_id):
+        row = self.db.execute("SELECT games FROM pcs WHERE id=?", (pc_id,)).fetchone()
+        try:
+            return json.loads(row["games"] or "[]") if row else []
+        except json.JSONDecodeError:
+            return []
+
+    def games_for_pc(self, pc_id):
+        """Games the agent should show in its launcher: installed on this rig and launchable."""
+        installed = set(self.pc_games(pc_id))
+        return [g for g in self.list_games() if g["id"] in installed and g["launch"]]
+
+    def account_conflicts(self, pc_ids):
+        """Warn when two rigs in the same booking use the same Steam/EA account."""
+        seen, out = {}, []
+        for p in pc_ids:
+            row = self._pc(p)
+            acc = (row["account"] or "").strip().lower()
+            if acc:
+                if acc in seen:
+                    out.append(f"{seen[acc]} and {row['name']} use the same game account "
+                               f"({row['account']}) - only one can play online at a time")
+                else:
+                    seen[acc] = row["name"]
+        return out
+
+    def list_games(self):
+        return [dict(r) for r in self.db.execute("SELECT * FROM games ORDER BY sort, name COLLATE NOCASE")]
+
+    def save_game(self, data):
+        name = str(data.get("name", "")).strip()[:60]
+        if not name:
+            raise ApiError(400, "Game name is required")
+        vals = (name, str(data.get("launch", "")).strip()[:500], str(data.get("category", "")).strip()[:30],
+                int(data.get("max_players") or 0), int(data.get("sort") or 0))
+        with self.lock:
+            if data.get("id"):
+                self._game(data["id"])
+                self.db.execute("UPDATE games SET name=?, launch=?, category=?, max_players=?, sort=? WHERE id=?",
+                                vals + (int(data["id"]),))
+                gid = int(data["id"])
+            else:
+                gid = self.db.execute("INSERT INTO games (name, launch, category, max_players, sort)"
+                                      " VALUES (?,?,?,?,?)", vals).lastrowid
+            self.db.commit()
+            return gid
+
+    def delete_game(self, game_id):
+        with self.lock:
+            self._game(game_id)
+            gid = int(game_id)
+            self.db.execute("DELETE FROM games WHERE id=?", (gid,))
+            self.db.execute("UPDATE packages SET game_id=NULL WHERE game_id=?", (gid,))
+            for r in self.db.execute("SELECT id, games FROM pcs").fetchall():
+                ids = [g for g in json.loads(r["games"] or "[]") if g != gid]
+                self.db.execute("UPDATE pcs SET games=? WHERE id=?", (json.dumps(ids), r["id"]))
+            self.db.commit()
+
+    def log_launch(self, pc_id, game_id):
+        with self.lock:
+            game = self._game(game_id)
+            s = self.active_session(pc_id)
+            if not s:
+                raise ApiError(409, "No running session")
+            self.db.execute("INSERT INTO game_launches (ts, pc_id, game_id, game_name, session_id)"
+                            " VALUES (?,?,?,?,?)", (now(), pc_id, game["id"], game["name"], s["id"]))
+            self.db.commit()
+
+    # ---- packages ---------------------------------------------------------------
+    def list_packages(self):
+        return [dict(r) for r in self.db.execute(
+            "SELECT p.*, g.name AS game_name FROM packages p LEFT JOIN games g ON g.id=p.game_id"
+            " WHERE p.active=1 ORDER BY p.rigs, p.minutes")]
+
+    def save_package(self, data):
+        name = str(data.get("name", "")).strip()[:60]
+        minutes, price, rigs = int(data.get("minutes") or 0), float(data.get("price") or 0), int(data.get("rigs") or 1)
+        if not name or minutes <= 0 or price < 0 or rigs < 1:
+            raise ApiError(400, "Package needs a name, minutes > 0, price >= 0 and rigs >= 1")
+        game_id = int(data["game_id"]) if data.get("game_id") else None
+        with self.lock:
+            if game_id:
+                self._game(game_id)
+            vals = (name, minutes, round(price, 2), rigs, game_id)
+            if data.get("id"):
+                self.db.execute("UPDATE packages SET name=?, minutes=?, price=?, rigs=?, game_id=? WHERE id=?",
+                                vals + (int(data["id"]),))
+                pid = int(data["id"])
+            else:
+                pid = self.db.execute("INSERT INTO packages (name, minutes, price, rigs, game_id)"
+                                      " VALUES (?,?,?,?,?)", vals).lastrowid
+            self.db.commit()
+            return pid
+
+    def delete_package(self, package_id):
+        with self.lock:  # soft delete keeps history readable
+            self.db.execute("UPDATE packages SET active=0 WHERE id=?", (int(package_id),))
+            self.db.commit()
 
     # ---- members ------------------------------------------------------------
     def members(self, q=""):
@@ -518,6 +752,10 @@ class Cafe:
                 "SELECT * FROM transactions WHERE ts>=? AND ts<? ORDER BY ts", (start, end))]
             sessions = [dict(r) for r in self.db.execute(
                 "SELECT * FROM sessions WHERE started>=? AND started<? ORDER BY started", (start, end))]
+            top_games = [dict(r) for r in self.db.execute(
+                "SELECT game_name AS name, COUNT(*) AS launches, COUNT(DISTINCT pc_id) AS rigs"
+                " FROM game_launches WHERE ts>=? AND ts<? GROUP BY game_name ORDER BY launches DESC",
+                (start, end))]
         cash_in = sum(t["amount"] for t in txns if t["kind"] in ("session_prepaid", "session_postpaid", "topup"))
         refunds = sum(t["amount"] for t in txns if t["kind"] == "refund")
         usage = sum(t["amount"] for t in txns if t["kind"] == "member_usage")
@@ -529,18 +767,21 @@ class Cafe:
             "member_usage": round(usage, 2),
             "sessions": len(sessions),
             "hours_played": round(sum((s["minutes"] or (now() - s["started"]) / 60) for s in sessions) / 60, 1),
+            "package_sales": round(sum(s["prepaid"] or 0 for s in sessions if s["package"]), 2),
+            "group_bookings": len({s["group_id"] for s in sessions if s["group_id"]}),
         }
-        return {"totals": totals, "transactions": txns, "sessions": sessions}
+        return {"totals": totals, "transactions": txns, "sessions": sessions, "top_games": top_games}
 
     def report_csv(self, day):
         rep = self.report(day)
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["Session ID", "PC", "User", "Type", "Rate/hr", "Start", "End",
+        w.writerow(["Session ID", "PC", "User", "Type", "Package", "Group", "Rate/hr", "Start", "End",
                     "Minutes", "Amount", "End reason"])
         fmt = lambda ts: dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else ""
         for s in rep["sessions"]:
-            w.writerow([s["id"], s["pc_name"], s["user_label"], s["mode"], s["rate"], fmt(s["started"]),
+            w.writerow([s["id"], s["pc_name"], s["user_label"], s["mode"], s["package"] or "",
+                        s["group_id"] or "", s["rate"], fmt(s["started"]),
                         fmt(s["ended"]), s["minutes"] if s["minutes"] is not None else "running",
                         s["amount"] if s["ended"] else s["prepaid"], s["end_reason"] or ""])
         w.writerow([])
@@ -548,6 +789,11 @@ class Cafe:
         w.writerow(["Time", "Type", "PC", "Amount", "Method", "Note"])
         for t in rep["transactions"]:
             w.writerow([fmt(t["ts"]), t["kind"], t["pc_id"] or "", t["amount"], t["method"] or "", t["note"] or ""])
+        w.writerow([])
+        w.writerow(["Games played"])
+        w.writerow(["Game", "Launches", "Rigs"])
+        for g in rep["top_games"]:
+            w.writerow([g["name"], g["launches"], g["rigs"]])
         w.writerow([])
         for k, v in rep["totals"].items():
             w.writerow([k, v])
@@ -648,6 +894,9 @@ def make_handler(cafe):
                 if action == "login":
                     cafe.member_login(pc_id, str(body.get("username", "")), str(body.get("password", "")))
                     return self._json({"ok": True})
+                if action == "launch":
+                    cafe.log_launch(pc_id, body.get("game_id"))
+                    return self._json({"ok": True})
                 if action == "logout":
                     with cafe.lock:
                         s = cafe.active_session(pc_id)
@@ -682,6 +931,10 @@ def make_handler(cafe):
                 if method == "POST":
                     if action == "start":
                         mode = body.get("mode", "prepaid")
+                        if mode == "package":
+                            r = cafe.start_group([pc_id], body.get("package_id"), label=body.get("label"),
+                                                 method=body.get("method", "cash"), game_id=body.get("game_id"))
+                            return self._json(dict(ok=True, **r))
                         member_id = None
                         if mode == "member":
                             with cafe.lock:
@@ -693,14 +946,20 @@ def make_handler(cafe):
                         sid = cafe.start_session(pc_id, mode, body.get("minutes"), member_id,
                                                  (body.get("label") or "").strip()[:40] or None,
                                                  body.get("method", "cash"))
-                        return self._json({"ok": True, "session_id": sid})
+                        warnings = []
+                        if body.get("game_id"):
+                            try:
+                                cafe.command(pc_id, "launch", game_id=body["game_id"])
+                            except ApiError as e:
+                                warnings.append(e.message)
+                        return self._json({"ok": True, "session_id": sid, "warnings": warnings})
                     if action == "addtime":
                         cafe.add_time(pc_id, body.get("minutes", 0), body.get("method", "cash"))
                         return self._json({"ok": True})
                     if action == "end":
                         return self._json({"ok": True, "bill": cafe.end_session(pc_id)})
                     if action == "command":
-                        bill = cafe.command(pc_id, body.get("type"), body.get("text"))
+                        bill = cafe.command(pc_id, body.get("type"), body.get("text"), body.get("game_id"))
                         return self._json({"ok": True, "bill": bill})
                     if action == "update":
                         cafe.update_pc(pc_id, body)
@@ -711,11 +970,29 @@ def make_handler(cafe):
                 results = {}
                 for pc_id in ids:
                     try:
-                        cafe.command(pc_id, body.get("type"), body.get("text"))
+                        cafe.command(pc_id, body.get("type"), body.get("text"), body.get("game_id"))
                         results[pc_id] = "ok"
                     except ApiError as e:
                         results[pc_id] = e.message
                 return self._json({"ok": True, "results": results})
+
+            if route == ["group", "start"] and method == "POST":
+                return self._json(dict(ok=True, **cafe.start_group(
+                    body.get("ids"), body.get("package_id"), body.get("minutes"), body.get("label"),
+                    body.get("method", "cash"), body.get("game_id"))))
+            if route[:1] == ["group"] and len(route) == 3 and route[2] == "end" and method == "POST":
+                return self._json(dict(ok=True, **cafe.end_group(route[1])))
+
+            for coll, save, delete in (("games", cafe.save_game, cafe.delete_game),
+                                       ("packages", cafe.save_package, cafe.delete_package)):
+                if route == [coll]:
+                    if method == "GET":
+                        return self._json(cafe.list_games() if coll == "games" else cafe.list_packages())
+                    if method == "POST":
+                        return self._json({"ok": True, "id": save(body)})
+                if route[:1] == [coll] and len(route) == 2 and method == "DELETE":
+                    delete(route[1])
+                    return self._json({"ok": True})
 
             if route == ["members"]:
                 if method == "GET":
