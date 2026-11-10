@@ -1,0 +1,4 @@
+server/data/
+client/agent_config.json
+__pycache__/
+*.pyc
