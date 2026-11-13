@@ -276,5 +276,97 @@ class CafeTest(unittest.TestCase):
         self.assertEqual(next(p for p in c.state()["pcs"] if p["id"] == "OLD")["account"], "")
 
 
+    # ---- v3: monitoring -------------------------------------------------------
+    def raw_screen(self, pc_id, data=b"\x89PNGfake", mime="image/png", key=None):
+        req = urllib.request.Request(self.base + "/api/agent/screen", data=data, method="POST", headers={
+            "Content-Type": mime, "X-Agent-Key": key or self.cafe.cfg["agent_key"], "X-PC-Id": pc_id})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return {"_status": e.code}
+
+    def get_raw(self, path):
+        req = urllib.request.Request(self.base + path, headers={"X-Admin-Token": self.token})
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.headers.get("Content-Type"), r.read()
+
+    def test_screen_view_flow(self):
+        self.agent("MON-1")
+        self.assertIsNone(self.agent("MON-1")["watch"])               # nobody watching -> no streaming
+        status, _, _ = self.get_raw("/api/pc/MON-1/screen?mode=thumb")
+        self.assertEqual(status, 204)                                 # no frame yet
+        self.assertEqual(self.agent("MON-1")["watch"], "thumb")       # agent is now asked to stream
+        self.get_raw("/api/pc/MON-1/screen?mode=full")
+        self.assertEqual(self.agent("MON-1")["watch"], "full")
+        self.assertEqual(self.raw_screen("MON-1", b"jpegbytes", "image/jpeg")["watch"], "full")
+        status, ctype, body = self.get_raw("/api/pc/MON-1/screen?mode=full")
+        self.assertEqual((status, ctype, body), (200, "image/jpeg", b"jpegbytes"))
+        self.assertEqual(self.raw_screen("MON-1", key="wrong")["_status"], 403)
+        self.assertEqual(self.raw_screen("MON-1", mime="text/html")["_status"], 400)
+        # watching expires
+        self.cafe.live["MON-1"]["watch"] = {"full": 0, "thumb": 0}
+        self.assertIsNone(self.agent("MON-1")["watch"])
+        # owner can turn screen view off entirely
+        self.call("/api/settings", {"monitoring": {"screen_view": False}})
+        self.assertEqual(self.call("/api/pc/MON-1/screen")["_status"], 403)
+        self.assertFalse(self.agent("MON-1")["policy"]["screen_view"])
+        self.call("/api/settings", {"monitoring": {"screen_view": True}})
+
+    def test_activity_and_processes(self):
+        self.call("/api/agent/heartbeat", {"key": self.cafe.cfg["agent_key"], "pc_id": "MON-2", "name": "MON-2",
+                                           "info": {"active": {"title": "YouTube - Chrome", "app": "chrome.exe"}}})
+        pc = next(p for p in self.call("/api/state")["pcs"] if p["id"] == "MON-2")
+        self.assertEqual(pc["activity"]["title"], "YouTube - Chrome")
+        self.call("/api/pc/MON-2/processes?refresh=1")
+        self.assertIn("processes", [c["type"] for c in self.agent("MON-2")["commands"]])
+        self.agent("MON-2", "processes", list=[{"name": "chrome.exe", "pid": 7, "mem_mb": 300}])
+        self.assertEqual(self.call("/api/pc/MON-2/processes")["list"][0]["name"], "chrome.exe")
+        # closing an app
+        self.call("/api/pc/MON-2/command", {"type": "kill", "text": "chrome.exe"})
+        cmd = self.agent("MON-2")["commands"][0]
+        self.assertEqual((cmd["type"], cmd["text"]), ("kill", "chrome.exe"))
+        self.assertEqual(self.call("/api/pc/MON-2/command", {"type": "kill", "text": "lsass.exe"})["_status"], 400)
+        self.assertEqual(self.call("/api/pc/MON-2/command", {"type": "kill", "text": "a.exe;del"})["_status"], 400)
+
+    def test_policy_settings_and_delivery(self):
+        r = self.call("/api/settings", {"monitoring": {"blocked_apps": "qbittorrent.exe\n\n  tor.exe ",
+                                                       "blocked_keywords": ["casino"],
+                                                       "blocked_sites": "bad-site.com"}})
+        self.assertEqual(r["monitoring"]["blocked_apps"], ["qbittorrent.exe", "tor.exe"])
+        pol = self.agent("MON-3")["policy"]
+        self.assertEqual(pol["blocked_sites"], ["bad-site.com"])
+        self.assertEqual(pol["blocked_keywords"], ["casino"])
+        self.assertEqual(self.call("/api/settings", {"monitoring": {"on_violation": "nuke"}})["_status"], 400)
+
+    def test_alerts_alert_only_and_auto_lock(self):
+        import base64
+        self.agent("MON-4")
+        self.call("/api/settings", {"monitoring": {"on_violation": "alert"}})
+        self.call("/api/pc/MON-4/start", {"mode": "prepaid", "minutes": 60, "label": "Guest"})
+        r = self.agent("MON-4", "alert", kind="blocked_word", detail='"casino" on screen',
+                       image=base64.b64encode(b"img").decode(), mime="image/jpeg")
+        self.assertEqual(self.agent("MON-4")["state"], "active")        # alert only: keeps playing
+        st = self.call("/api/state")
+        self.assertGreaterEqual(st["alerts_open"], 1)
+        self.assertEqual(next(p for p in st["pcs"] if p["id"] == "MON-4")["alert"]["id"], r["id"])
+        a = next(x for x in self.call("/api/alerts") if x["id"] == r["id"])
+        self.assertEqual((a["user_label"], a["action"], a["has_image"]), ("Guest", "alert", 1))
+        self.assertEqual(self.get_raw(f"/api/alerts/{r['id']}/image")[2], b"img")
+        self.call("/api/alerts/ack", {"ids": [r["id"]]})
+        self.assertNotIn(r["id"], [x["id"] for x in self.call("/api/alerts?open=1")])
+
+        # auto-lock mode ends the session and tells the customer
+        self.call("/api/settings", {"monitoring": {"on_violation": "lock"}})
+        self.agent("MON-4", "alert", kind="blocked_app", detail="Blocked app running: tor.exe")
+        hb = self.agent("MON-4")
+        self.assertEqual(hb["state"], "locked")
+        self.assertTrue(any(c["type"] == "message" and "cafe rules" in c["text"] for c in hb["commands"]))
+        rep = self.call("/api/report")
+        self.assertEqual([s for s in rep["sessions"] if s["pc_id"] == "MON-4"][-1]["end_reason"], "policy_violation")
+        self.call("/api/settings", {"monitoring": {"on_violation": "alert"}})
+        self.call("/api/alerts/ack", {})
+        self.assertEqual(self.call("/api/state")["alerts_open"], 0)
+
 if __name__ == "__main__":
     unittest.main()

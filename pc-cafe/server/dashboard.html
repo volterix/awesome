@@ -70,6 +70,21 @@ input[type=text],input[type=password],input[type=number],input[type=date],select
 .warnbox{background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.45);color:#e3b341;border-radius:8px;padding:8px 10px;font-size:12px;margin:8px 0}
 .checks{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
 .checks label{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--text)}
+.modal.wide{width:min(1120px,100%)}
+.pc.alerted{border-color:var(--red);box-shadow:0 0 0 1px var(--red) inset}
+.now{font-size:12px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{display:inline-block;min-width:18px;padding:0 5px;border-radius:9px;background:var(--red);color:#fff;font-size:11px;line-height:18px;text-align:center;margin-left:4px}
+.screens{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:22px}
+.scr{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer}
+.scr:hover{border-color:var(--accent)} .scr.alerted{border-color:var(--red)}
+.scr .shot{aspect-ratio:16/9;background:#000;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px}
+.scr .shot img,.viewer img{width:100%;height:100%;object-fit:contain;display:block}
+.scr .cap{padding:8px 10px;font-size:12px}
+.scr .cap b{font-size:13px}
+.viewer{background:#000;border-radius:8px;aspect-ratio:16/9;max-height:62vh;margin:0 auto;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+.vbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0}
+.procs{max-height:260px;overflow:auto;margin-top:8px}
+textarea{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 9px;font:inherit;color:inherit;min-height:90px;resize:vertical}
 .empty{padding:40px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:10px}
 code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break-all}
 @media (max-width:640px){header{padding:10px 16px}main{padding:14px 16px}.kpis{margin-left:0;width:100%}}
@@ -91,6 +106,7 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
   <h1 id="cafeName">CafeMaster</h1>
   <nav>
     <button data-tab="pcs" class="on">PCs</button>
+    <button data-tab="monitor">Monitor<span class="badge hide" id="navAlerts"></span></button>
     <button data-tab="members">Members</button>
     <button data-tab="games">Games</button>
     <button data-tab="packages">Packages</button>
@@ -102,6 +118,7 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
     <div class="kpi">Free<b id="kFree">0</b></div>
     <div class="kpi">Offline<b id="kOff">0</b></div>
     <div class="kpi">Cash today<b id="kCash">0</b></div>
+    <div class="kpi" style="cursor:pointer" onclick="openTab('monitor')">Alerts<b id="kAlerts">0</b></div>
   </div>
 </header>
 
@@ -120,6 +137,21 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
       <button class="btn danger" data-bulk="shutdown">Shut down</button>
     </div>
     <div id="grid" class="grid"></div>
+  </section>
+
+  <!-- Monitor -->
+  <section id="tab-monitor" class="hide">
+    <div class="bar">
+      <span class="muted">Live screens of PCs that are switched on. Click a screen to watch it full size and take action.</span>
+      <span class="sp"></span>
+      <label class="chip"><input type="checkbox" id="monAll"> Show idle PCs too</label>
+    </div>
+    <div id="screens" class="screens"></div>
+    <div class="bar"><h3 style="margin:0">Rule alerts</h3><span class="sp"></span>
+      <label class="chip"><input type="checkbox" id="alOpen" checked> Unreviewed only</label>
+      <button class="btn" id="alAck">Mark all reviewed</button></div>
+    <table><thead><tr><th>Time</th><th>PC</th><th>Customer</th><th>What happened</th><th>Action</th><th>Screenshot</th><th></th></tr></thead>
+    <tbody id="alBody"></tbody></table>
   </section>
 
   <!-- Members -->
@@ -187,6 +219,18 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
       <div class="row"><label>Agent key (paste into each gaming PC's agent config)</label><code id="sKey"></code></div>
       <div class="foot"><button class="btn pri" id="sSave">Save settings</button></div>
     </div>
+    <div class="card" style="max-width:560px;margin-top:16px">
+      <h3 style="margin-top:0">Monitoring &amp; cafe rules</h3>
+      <div class="row"><label class="chip" style="align-self:flex-start"><input type="checkbox" id="mScreen"> Allow live screen view from this dashboard</label></div>
+      <div class="row"><label>Blocked programs — closed automatically when started (one per line, e.g. qbittorrent.exe)</label><textarea id="mApps"></textarea></div>
+      <div class="row"><label>Blocked words — raise an alert when they appear in a window or browser-tab title (one per line)</label><textarea id="mWords"></textarea></div>
+      <div class="row"><label>Blocked websites — unreachable on every PC (one domain per line, e.g. example.com)</label><textarea id="mSites"></textarea></div>
+      <div class="row"><label>When a rule is broken</label><select id="mAction">
+        <option value="alert">Alert staff only (screenshot saved)</option>
+        <option value="lock">Lock the PC immediately and end the session</option></select></div>
+      <div class="sub">A notice on every lock screen tells customers that staff may view screens and close programs.</div>
+      <div class="foot"><button class="btn pri" id="mSave">Save rules</button></div>
+    </div>
   </section>
 </main>
 </div>
@@ -238,6 +282,7 @@ $$('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.tab==='members') loadMembers();
   if (b.dataset.tab==='reports') loadReport();
   if (b.dataset.tab==='settings') loadSettings();
+  if (b.dataset.tab==='monitor'){ renderScreens(); pollThumbs(); loadAlerts() }
   if (b.dataset.tab==='games') renderGames();
   if (b.dataset.tab==='packages') renderPackages();
 });
@@ -256,6 +301,10 @@ function render(){
   $('#kFree').textContent = pcs.filter(p=>p.status==='idle').length;
   $('#kOff').textContent = pcs.filter(p=>!p.online).length;
   $('#kCash').textContent = money(state.today.cash_collected);
+  $('#kAlerts').textContent = state.alerts_open; $('#kAlerts').style.color = state.alerts_open ? 'var(--red)' : '';
+  $('#navAlerts').textContent = state.alerts_open; $('#navAlerts').classList.toggle('hide', !state.alerts_open);
+  if (!$('#tab-monitor').classList.contains('hide')) renderScreens();
+  if (viewerId) updateViewerInfo();
   for (const id of [...selected]) if (!pcs.find(p=>p.id===id)) selected.delete(id);
   $('#selCount').textContent = selected.size ? `${selected.size} selected` : '';
   $('#selAll').checked = pcs.length && selected.size === pcs.length;
@@ -281,12 +330,13 @@ function pcCard(p){
   } else a.push(`<button class="btn sm pri" onclick="startModal('${p.id}')">Start</button>`);
   a.push(`<button class="btn sm" onclick="msgModal(['${p.id}'])">Msg</button>`);
   a.push(`<button class="btn sm" onclick="pcModal('${p.id}')">⋯</button>`);
-  return `<div class="pc ${cls} ${selected.has(p.id)?'sel':''}">
+  if (p.online) a.splice(a.length-1, 0, `<button class="btn sm" onclick="openViewer('${p.id}')" title="View screen">View</button>`);
+  return `<div class="pc ${cls} ${selected.has(p.id)?'sel':''} ${p.alert?'alerted':''}">
     <div class="pc-h"><input type="checkbox" ${selected.has(p.id)?'checked':''} onchange="toggleSel('${p.id}',this.checked)">
       <span class="pc-name">${esc(p.name)}</span><span class="tag">${esc(p.group)}</span>
       <span class="st">${labels[p.status]}</span></div>
     <div class="timer">${timer}${s && s.group_id ? `<span class="grp">${esc(groupName(s))}</span>` : ''}</div><div class="sub">${sub}</div>
-    ${acctLine(p)}
+    ${acctLine(p)}${nowLine(p)}
     <div class="acts">${a.join('')}</div></div>`;
 }
 const gameById = id => state.games.find(g=>g.id===id);
@@ -310,7 +360,7 @@ $$('[data-bulk]').forEach(b => b.onclick = () => {
 });
 
 // ---------- modals ----------
-function modal(html){ $('#modal').innerHTML = html; $('#modalBg').classList.add('show'); const f=$('#modal input:not([type=hidden])'); f&&f.focus() }
+function modal(html){ $('#modal').classList.remove('wide'); $('#modal').innerHTML = html; $('#modalBg').classList.add('show'); const f=$('#modal input:not([type=hidden])'); f&&f.focus() }
 function closeModal(){ $('#modalBg').classList.remove('show') }
 $('#modalBg').onclick = e => { if (e.target.id==='modalBg') closeModal() };
 document.addEventListener('keydown', e => { if (e.key==='Escape') closeModal() });
@@ -598,7 +648,7 @@ async function loadReport(){
       ['Group bookings', t.group_bookings]].map(([k,v])=>`<div class="card"><small>${k}</small><b>${v}</b></div>`).join('');
     $('#rGames').innerHTML = r.top_games.length ? `<h3>Games played</h3><table style="margin-bottom:16px"><thead><tr><th>Game</th><th>Launches</th><th>Rigs</th></tr></thead><tbody>${
       r.top_games.map(g=>`<tr><td>${esc(g.name)}</td><td>${g.launches}</td><td>${g.rigs}</td></tr>`).join('')}</tbody></table>` : '';
-    const reason = {staff:'Staff', time_up:'Time up', user_logout:'User', locked_by_staff:'Staff lock', shutdown:'Shutdown', restart:'Restart', logoff:'Log off'};
+    const reason = {staff:'Staff', time_up:'Time up', user_logout:'User', locked_by_staff:'Staff lock', shutdown:'Shutdown', restart:'Restart', logoff:'Log off', policy_violation:'Rule broken'};
     $('#rBody').innerHTML = r.sessions.length ? r.sessions.map(s=>`<tr><td>${fmtTime(s.started)}</td><td>${s.ended?fmtTime(s.ended):'<i>running</i>'}</td>
       <td>${esc(s.pc_name)}</td><td>${esc(s.user_label)}</td><td>${esc(s.mode)}</td><td>${esc(s.package||'')}</td><td>${s.minutes!=null?Math.round(s.minutes):''}</td>
       <td>${money(s.ended ? s.amount : s.prepaid)}</td><td>${esc(reason[s.end_reason]||s.end_reason||'')}</td></tr>`).join('')
@@ -614,6 +664,9 @@ $('#sAddRate').onclick = () => rateRow();
 async function loadSettings(){
   try { const s = await api('/settings');
     $('#sName').value=s.cafe_name; $('#sCur').value=s.currency; $('#sMin').value=s.min_minutes; $('#sRound').value=s.round_to_minutes;
+    const m = s.monitoring || {}; $('#mScreen').checked = m.screen_view !== false;
+    $('#mApps').value=(m.blocked_apps||[]).join('\n'); $('#mWords').value=(m.blocked_keywords||[]).join('\n');
+    $('#mSites').value=(m.blocked_sites||[]).join('\n'); $('#mAction').value=m.on_violation||'alert';
     $('#sKey').textContent=s.agent_key; $('#sPw').value=''; $('#sRates').innerHTML=''; Object.entries(s.rates).forEach(([g,v])=>rateRow(g,v));
   } catch(e){ toast(e.message, true) }
 }
@@ -622,8 +675,153 @@ $('#sSave').onclick = () => { const rates={}; $$('#sRates .bar').forEach(r=>{ co
   if ($('#sPw').value) body.admin_password=$('#sPw').value;
   act(()=>api('/settings',{body}), 'Settings saved').then(loadSettings) };
 
+$('#mSave').onclick = () => act(()=>api('/settings',{body:{monitoring:{screen_view:$('#mScreen').checked,
+  blocked_apps:$('#mApps').value, blocked_keywords:$('#mWords').value, blocked_sites:$('#mSites').value,
+  on_violation:$('#mAction').value}}}), 'Rules saved — PCs pick them up within a few seconds').then(loadSettings);
+
+// ---------- monitor: live screens ----------
+const thumbs = {};          // pc_id -> object URL of latest thumbnail
+let viewerId = null, viewerTimer = null, viewerUrl = null;
+function openTab(name){ $(`nav button[data-tab=${name}]`).click() }
+function nowLine(p){
+  const a = p.activity || {};
+  if (!p.online || !(a.title || a.app)) return '';
+  return `<div class="now" title="${esc(a.title)}">▸ ${esc(a.title || a.app)}</div>`;
+}
+function monitoredPcs(){ return state.pcs.filter(p => p.online && (p.session || $('#monAll').checked)) }
+$('#monAll').onchange = () => { renderScreens(); pollThumbs() };
+function renderScreens(){
+  const pcs = monitoredPcs();
+  $('#screens').innerHTML = pcs.length ? pcs.map(p => { const a = p.activity || {}, s = p.session;
+    return `<div class="scr ${p.alert?'alerted':''}" onclick="openViewer('${p.id}')">
+      <div class="shot" id="shot-${p.id}">${thumbs[p.id] ? `<img src="${thumbs[p.id]}" alt="">` : 'Waiting for screen…'}</div>
+      <div class="cap"><b>${esc(p.name)}</b> · ${s ? esc(s.user) : '<span class="muted">locked</span>'}
+        ${p.alert ? `<span class="badge">!</span>` : ''}
+        <div class="now muted" title="${esc(a.title)}">${esc(a.title || a.app || '—')}</div></div></div>` }).join('')
+    : `<div class="empty" style="grid-column:1/-1">No PCs in use right now. Tick “Show idle PCs too” to see locked PCs.</div>`;
+}
+async function fetchFrame(id, mode){
+  const r = await fetch(`/api/pc/${id}/screen?mode=${mode}`, {headers:{'X-Admin-Token':token}});
+  if (r.status === 403) throw new Error((await r.json()).error);
+  if (r.status !== 200) return null;
+  return URL.createObjectURL(await r.blob());
+}
+let thumbTimer;
+async function pollThumbs(){
+  clearTimeout(thumbTimer);
+  if (!token || !state || $('#tab-monitor').classList.contains('hide')) return;
+  await Promise.all(monitoredPcs().map(async p => {
+    try { const url = await fetchFrame(p.id, 'thumb'); if (!url) return;
+      if (thumbs[p.id]) URL.revokeObjectURL(thumbs[p.id]); thumbs[p.id] = url;
+      const el = document.getElementById('shot-'+p.id); if (el) el.innerHTML = `<img src="${url}" alt="">`;
+    } catch(e){ toast(e.message, true) }
+  }));
+  thumbTimer = setTimeout(pollThumbs, 4000);
+}
+
+// ---------- monitor: full viewer ----------
+function openViewer(id){
+  const p = pcById(id); viewerId = id;
+  modal(`<div class="bar" style="margin:0"><h3 style="margin:0" id="vTitle"></h3><span class="sp"></span>
+      <span class="muted" id="vAge"></span><button class="btn" onclick="closeViewer()">Close</button></div>
+    <div class="sub" id="vNow" style="margin:6px 0 10px"></div>
+    <div class="vbar">
+      <button class="btn danger" style="background:var(--red);border-color:var(--red);color:#fff" onclick="viewerLock()">Lock now</button>
+      <button class="btn" onclick="viewerCloseApp()" id="vCloseApp">Close current app</button>
+      <button class="btn" onclick="msgModalKeepViewer()">Send warning</button>
+      <button class="btn" onclick="toggleProcs()">Running programs</button>
+      <span class="sp"></span>
+      <button class="btn danger" onclick="cmd('${id}','restart')">Restart</button>
+      <button class="btn danger" onclick="cmd('${id}','shutdown')">Shut down</button>
+    </div>
+    <div id="vProcs" class="hide" style="margin-bottom:10px"></div>
+    <div class="viewer" id="vScreen">Connecting to ${esc(p.name)}… the first picture takes a few seconds.</div>`);
+  $('#modal').classList.add('wide');
+  updateViewerInfo(); pollViewer();
+}
+function closeViewer(){ viewerId = null; clearTimeout(viewerTimer); if (viewerUrl) URL.revokeObjectURL(viewerUrl); viewerUrl = null; closeModal() }
+function updateViewerInfo(){
+  const p = pcById(viewerId); if (!p || !$('#vTitle')) return;
+  const s = p.session, a = p.activity || {};
+  $('#vTitle').textContent = `${p.name} · ${s ? s.user : 'Locked'}`;
+  $('#vNow').innerHTML = `On screen: <b>${esc(a.title || '—')}</b>${a.app ? ` <span class="muted">(${esc(a.app)})</span>` : ''}` +
+    (p.alert ? `<div class="warnbox">⚠ ${esc(p.alert.detail)}</div>` : '');
+  $('#vCloseApp').disabled = !a.app;
+}
+async function pollViewer(){
+  clearTimeout(viewerTimer);
+  if (!viewerId || !$('#modalBg').classList.contains('show')) { viewerId = null; return }
+  try { const url = await fetchFrame(viewerId, 'full');
+    if (url && viewerId){ if (viewerUrl) URL.revokeObjectURL(viewerUrl); viewerUrl = url; $('#vScreen').innerHTML = `<img src="${url}" alt="Live screen">` }
+  } catch(e){ $('#vScreen').textContent = e.message }
+  viewerTimer = setTimeout(pollViewer, 1000);
+}
+async function viewerLock(){
+  const p = pcById(viewerId);
+  if (!confirm(`Lock ${p.name} now? The session ends and the customer is locked out.`)) return;
+  const r = await act(()=>api(`/pc/${viewerId}/command`, {body:{type:'lock'}}), `${p.name} locked`);
+  if (r) api(`/pc/${viewerId}/command`, {body:{type:'message', text:'This PC was locked by staff. Please see the counter.'}}).catch(()=>{});
+}
+async function viewerCloseApp(){
+  const p = pcById(viewerId), app = (p.activity||{}).app;
+  if (app && confirm(`Close ${app} on ${p.name}?`)) act(()=>api(`/pc/${viewerId}/command`, {body:{type:'kill', text:app}}), `Closing ${app}`);
+}
+function msgModalKeepViewer(){
+  const text = prompt('Warning message to show on the customer\'s screen:', 'Please stop — this is not allowed in the cafe.');
+  if (text) act(()=>api(`/pc/${viewerId}/command`, {body:{type:'message', text}}), 'Warning sent');
+}
+let procTimer;
+async function toggleProcs(){
+  const box = $('#vProcs'); box.classList.toggle('hide');
+  if (box.classList.contains('hide')) return;
+  box.innerHTML = '<div class="sub">Asking the PC for its program list…</div>';
+  const id = viewerId, asked = Date.now()/1000 + clockOffset - 1;
+  try { await api(`/pc/${id}/processes?refresh=1`) } catch(e){ return toast(e.message, true) }
+  for (let i = 0; i < 10 && viewerId === id; i++){
+    await new Promise(r => setTimeout(r, 1000));
+    const d = await api(`/pc/${id}/processes`);
+    if (d.ts >= asked) return renderProcs(id, d.list);
+  }
+  box.innerHTML = '<div class="sub">The PC did not answer. Is the agent running?</div>';
+}
+function renderProcs(id, list){
+  $('#vProcs').innerHTML = `<div class="procs"><table><thead><tr><th>Program</th><th>PID</th><th>Memory</th><th></th></tr></thead><tbody>${
+    list.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.pid}</td><td>${x.mem_mb} MB</td>
+      <td style="text-align:right"><button class="btn sm danger" onclick="killProc('${id}', this.dataset.n)" data-n="${esc(x.name)}">Close</button></td></tr>`).join('')}</tbody></table></div>`;
+}
+async function killProc(id, name){
+  if (!confirm(`Close every ${name} on ${pcById(id).name}?`)) return;
+  const r = await act(()=>api(`/pc/${id}/command`, {body:{type:'kill', text:name}}), `Closing ${name}`);
+  if (r) setTimeout(()=>{ $('#vProcs').classList.add('hide'); toggleProcs() }, 2500);
+}
+
+// ---------- monitor: alerts ----------
+$('#alOpen').onchange = loadAlerts;
+$('#alAck').onclick = async () => { await act(()=>api('/alerts/ack', {body:{}}), 'All alerts marked reviewed'); loadAlerts() };
+async function loadAlerts(){
+  try { const rows = await api('/alerts' + ($('#alOpen').checked ? '?open=1' : ''));
+    const act_ = {alert:'Alert only', locked:'PC locked'};
+    $('#alBody').innerHTML = rows.length ? rows.map(a=>`<tr ${a.acked?'':'style="background:rgba(229,83,75,.07)"'}>
+      <td>${new Date(a.ts*1000).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}</td>
+      <td>${esc(a.pc_name)}</td><td>${esc(a.user_label)||'—'}</td><td>${esc(a.detail)}</td><td>${act_[a.action]||esc(a.action)}</td>
+      <td>${a.has_image?`<button class="btn sm" onclick="alertShot(${a.id})">View</button>`:'<span class="muted">—</span>'}</td>
+      <td style="text-align:right">${a.acked?'<span class="muted">reviewed</span>':`<button class="btn sm" onclick="ackAlert(${a.id})">Reviewed</button>`}</td></tr>`).join('')
+      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">No alerts. Rules are set in Settings › Monitoring.</td></tr>`;
+  } catch(e){ toast(e.message, true) }
+}
+async function ackAlert(id){ await act(()=>api('/alerts/ack', {body:{ids:[id]}})); loadAlerts() }
+async function alertShot(id){
+  const r = await fetch(`/api/alerts/${id}/image`, {headers:{'X-Admin-Token':token}});
+  if (!r.ok) return toast('Screenshot not available', true);
+  const url = URL.createObjectURL(await r.blob());
+  modal(`<div class="bar" style="margin:0 0 10px"><h3 style="margin:0">Screenshot at the time of the alert</h3><span class="sp"></span>
+    <button class="btn" onclick="closeModal()">Close</button></div><div class="viewer"><img src="${url}" alt=""></div>`);
+  $('#modal').classList.add('wide');
+}
+
 // ---------- loop ----------
 setInterval(refresh, 2000);
+setInterval(() => { if (state && !$('#tab-monitor').classList.contains('hide')) loadAlerts() }, 10000);
 setInterval(() => { if (state && !$('#tab-pcs').classList.contains('hide')) render() }, 1000);
 if (token) boot();
 </script>

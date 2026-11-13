@@ -9,6 +9,7 @@ from the web dashboard at http://<server-ip>:8080.
 Standard library only. Python 3.9+.
 """
 import argparse
+import base64
 import csv
 import datetime as dt
 import hashlib
@@ -16,6 +17,7 @@ import hmac
 import io
 import json
 import math
+import re
 import os
 import secrets
 import sqlite3
@@ -27,7 +29,11 @@ from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OFFLINE_AFTER = 10          # seconds without heartbeat => PC shown offline
-VALID_COMMANDS = {"message", "shutdown", "restart", "lock", "logoff", "launch"}
+VALID_COMMANDS = {"message", "shutdown", "restart", "lock", "logoff", "launch", "kill", "processes"}
+WATCH_SECONDS = 12          # a PC keeps streaming its screen this long after the dashboard last asked
+ALERT_IMAGE_DAYS = 7        # alert screenshots are deleted after this many days
+PROTECTED_PROCS = {"system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
+                   "lsass.exe", "svchost.exe", "dwm.exe", "python.exe", "pythonw.exe", "explorer.exe"}
 
 DEFAULT_CONFIG = {
     "cafe_name": "CafeMaster Gaming",
@@ -38,6 +44,13 @@ DEFAULT_CONFIG = {
     "rates": {"Standard": 60, "VIP": 100},  # per hour
     "min_minutes": 15,                      # minimum billable minutes (postpaid/member)
     "round_to_minutes": 1,                  # bill in blocks of N minutes
+    "monitoring": {
+        "screen_view": True,
+        "blocked_apps": ["qbittorrent.exe", "utorrent.exe", "bittorrent.exe", "tor.exe", "vuze.exe"],
+        "blocked_keywords": ["torrent", "magnet:"],
+        "blocked_sites": [],
+        "on_violation": "alert",            # alert | lock
+    },
 }
 
 
@@ -130,6 +143,10 @@ class Cafe:
             CREATE TABLE IF NOT EXISTS packages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, minutes INTEGER,
                 price REAL, rigs INTEGER DEFAULT 1, game_id INTEGER, active INTEGER DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, pc_id TEXT, pc_name TEXT,
+                user_label TEXT, session_id INTEGER, kind TEXT, detail TEXT, action TEXT,
+                image BLOB, mime TEXT, acked INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS game_launches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, pc_id TEXT,
                 game_id INTEGER, game_name TEXT, session_id INTEGER);
@@ -157,7 +174,12 @@ class Cafe:
 
     def public_settings(self):
         c = self.cfg
-        return {k: c[k] for k in ("cafe_name", "currency", "rates", "min_minutes", "round_to_minutes")}
+        return {k: c[k] for k in ("cafe_name", "currency", "rates", "min_minutes", "round_to_minutes",
+                                  "monitoring")}
+
+    def policy(self):
+        m = dict(DEFAULT_CONFIG["monitoring"], **self.cfg.get("monitoring", {}))
+        return {k: m[k] for k in ("blocked_apps", "blocked_keywords", "blocked_sites", "screen_view")}
 
     def update_settings(self, data):
         with self.lock:
@@ -173,6 +195,19 @@ class Cafe:
             for key in ("min_minutes", "round_to_minutes"):
                 if key in data:
                     self.cfg[key] = max(0 if key == "min_minutes" else 1, int(data[key]))
+            if "monitoring" in data:
+                m, cur = data["monitoring"], dict(DEFAULT_CONFIG["monitoring"], **self.cfg.get("monitoring", {}))
+                for key in ("blocked_apps", "blocked_keywords", "blocked_sites"):
+                    if key in m:
+                        items = m[key].splitlines() if isinstance(m[key], str) else m[key]
+                        cur[key] = [str(x).strip()[:120] for x in items if str(x).strip()][:200]
+                if "on_violation" in m:
+                    if m["on_violation"] not in ("alert", "lock"):
+                        raise ApiError(400, "on_violation must be alert or lock")
+                    cur["on_violation"] = m["on_violation"]
+                if "screen_view" in m:
+                    cur["screen_view"] = bool(m["screen_view"])
+                self.cfg["monitoring"] = cur
             if data.get("admin_password"):
                 if len(data["admin_password"]) < 6:
                     raise ApiError(400, "Admin password must be at least 6 characters")
@@ -452,6 +487,17 @@ class Cafe:
             raise ApiError(400, "Unknown command")
         with self.lock:
             self._pc(pc_id)
+            if ctype == "kill":
+                name = (text or "").strip()
+                if not name or len(name) > 100 or not re.match(r"^[\w .\-()+]+$", name):
+                    raise ApiError(400, "Invalid program name")
+                if name.lower() in PROTECTED_PROCS:
+                    raise ApiError(400, f"{name} is a Windows system process and can't be closed")
+                self.queue_command(pc_id, {"type": "kill", "text": name})
+                return None
+            if ctype == "processes":
+                self.queue_command(pc_id, {"type": "processes"})
+                return None
             if ctype == "launch":
                 game = self._game(game_id)
                 if not self.active_session(pc_id):
@@ -494,6 +540,7 @@ class Cafe:
                 "server_time": now(), "state": "active" if s else "locked",
                 "session": s, "commands": commands,
                 "games": self.games_for_pc(pc_id),
+                "watch": self.watch_mode(pc_id), "policy": self.policy(),
             }
 
     def update_pc(self, pc_id, data):
@@ -529,6 +576,9 @@ class Cafe:
         with self.lock:
             t = now()
             pcs = []
+            open_alerts = {}
+            for a in self.db.execute("SELECT id, pc_id, detail, ts FROM alerts WHERE acked=0 ORDER BY id"):
+                open_alerts[a["pc_id"]] = dict(a)
             for row in self.db.execute("SELECT * FROM pcs ORDER BY name COLLATE NOCASE"):
                 live = self.live.get(row["id"], {})
                 online = t - live.get("last_seen", 0) < OFFLINE_AFTER
@@ -540,6 +590,9 @@ class Cafe:
                     "status": ("in_use" if s else "idle") if online else ("in_use_offline" if s else "offline"),
                     "session": s, "account": row["account"] or "", "notes": row["notes"] or "",
                     "games": self.pc_games(row["id"]),
+                    "activity": (live.get("info") or {}).get("active") or {},
+                    "has_screen": bool(live.get("screen")),
+                    "alert": open_alerts.get(row["id"]),
                 })
             by_account = {}
             for p in pcs:
@@ -551,7 +604,96 @@ class Cafe:
                 p["shares_account_with"] = others
             return {"server_time": t, "settings": self.public_settings(), "pcs": pcs,
                     "games": self.list_games(), "packages": self.list_packages(),
+                    "alerts_open": self.db.execute("SELECT COUNT(*) FROM alerts WHERE acked=0").fetchone()[0],
                     "today": self.report(dt.date.today().isoformat())["totals"]}
+
+    # ---- monitoring: live screens, processes, alerts ---------------------------
+    def _live(self, pc_id):
+        return self.live.setdefault(pc_id, {"last_seen": 0, "ip": "", "commands": [], "info": {}})
+
+    def watch_mode(self, pc_id):
+        """'full' while someone has this PC open in the viewer, 'thumb' while the Monitor grid shows it."""
+        if not self.policy()["screen_view"]:
+            return None
+        w = self._live(pc_id).get("watch", {})
+        t = now()
+        if w.get("full", 0) > t:
+            return "full"
+        if w.get("thumb", 0) > t:
+            return "thumb"
+        return None
+
+    def put_screen(self, pc_id, data, mime):
+        if mime not in ("image/png", "image/jpeg"):
+            raise ApiError(400, "Unsupported image type")
+        with self.lock:
+            self._live(pc_id)["screen"] = {"data": data, "mime": mime, "ts": now()}
+
+    def get_screen(self, pc_id, mode="thumb"):
+        """Mark the PC as watched and return its latest frame (or None if none yet)."""
+        with self.lock:
+            self._pc(pc_id)
+            if not self.policy()["screen_view"]:
+                raise ApiError(403, "Screen view is turned off in Settings")
+            live = self._live(pc_id)
+            live.setdefault("watch", {})["full" if mode == "full" else "thumb"] = now() + WATCH_SECONDS
+            return live.get("screen")
+
+    def put_processes(self, pc_id, procs):
+        with self.lock:
+            clean = [{"name": str(p.get("name", ""))[:100], "pid": int(p.get("pid", 0)),
+                      "mem_mb": float(p.get("mem_mb", 0))} for p in (procs or [])[:500]]
+            self._live(pc_id)["processes"] = {"list": clean, "ts": now()}
+
+    def get_processes(self, pc_id):
+        with self.lock:
+            self._pc(pc_id)
+            return self._live(pc_id).get("processes") or {"list": [], "ts": 0}
+
+    def add_alert(self, pc_id, kind, detail, image=None, mime=None):
+        """Record a rule violation reported by a PC. Locks the PC if the policy says so."""
+        with self.lock:
+            pc = self._pc(pc_id)
+            s = self.active_session(pc_id)
+            action = "alert"
+            if self.cfg.get("monitoring", {}).get("on_violation") == "lock" and s:
+                action = "locked"
+            cur = self.db.execute(
+                "INSERT INTO alerts (ts, pc_id, pc_name, user_label, session_id, kind, detail, action, image, mime)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (now(), pc_id, pc["name"], s["user_label"] if s else "", s["id"] if s else None,
+                 str(kind)[:30], str(detail)[:300], action, image, mime))
+            # keep the database small: drop screenshots older than ALERT_IMAGE_DAYS
+            self.db.execute("UPDATE alerts SET image=NULL WHERE ts<? AND image IS NOT NULL",
+                            (now() - ALERT_IMAGE_DAYS * 86400,))
+            self.db.commit()
+            if action == "locked":
+                self.end_session(pc_id, reason="policy_violation")
+                self.queue_command(pc_id, {"type": "message",
+                                           "text": "This PC was locked for breaking cafe rules. Please see staff."})
+            return cur.lastrowid
+
+    def list_alerts(self, only_open=False, limit=100):
+        with self.lock:
+            q = ("SELECT id, ts, pc_id, pc_name, user_label, kind, detail, action, acked,"
+                 " image IS NOT NULL AS has_image FROM alerts")
+            q += " WHERE acked=0" if only_open else ""
+            return [dict(r) for r in self.db.execute(q + " ORDER BY id DESC LIMIT ?", (int(limit),))]
+
+    def alert_image(self, alert_id):
+        with self.lock:
+            r = self.db.execute("SELECT image, mime FROM alerts WHERE id=?", (int(alert_id),)).fetchone()
+        if not r or r["image"] is None:
+            raise ApiError(404, "No screenshot for this alert")
+        return r["image"], r["mime"]
+
+    def ack_alerts(self, ids=None):
+        with self.lock:
+            if ids:
+                self.db.executemany("UPDATE alerts SET acked=1 WHERE id=?", [(int(i),) for i in ids])
+            else:
+                self.db.execute("UPDATE alerts SET acked=1 WHERE acked=0")
+            self.db.commit()
 
     # ---- games catalogue & rig register ---------------------------------------
     def _game(self, game_id):
@@ -828,9 +970,9 @@ def make_handler(cafe):
         def _json(self, obj, status=200):
             self._send(status, json.dumps(obj, ensure_ascii=False))
 
-        def _body(self):
+        def _body(self, limit=1_000_000):
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 1_000_000:
+            if n > limit:
                 raise ApiError(413, "Request too large")
             if not n:
                 return {}
@@ -883,9 +1025,19 @@ def make_handler(cafe):
                 raise ApiError(404, "Not found")
             route = parts[1:]
 
+            # agent screen upload: raw image body, credentials in headers
+            if route == ["agent", "screen"] and method == "POST":
+                pc_id = self._agent({"key": self.headers.get("X-Agent-Key", ""),
+                                     "pc_id": self.headers.get("X-PC-Id", "")})
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 < n <= 8_000_000:
+                    raise ApiError(413, "Image too large")
+                cafe.put_screen(pc_id, self.rfile.read(n), self.headers.get("Content-Type", ""))
+                return self._json({"ok": True, "watch": cafe.watch_mode(pc_id)})
+
             # agent endpoints (gaming PCs)
             if route[:1] == ["agent"] and method == "POST":
-                body = self._body()
+                body = self._body(limit=8_000_000 if route[1:] == ["alert"] else 1_000_000)
                 pc_id = self._agent(body)
                 action = route[1] if len(route) > 1 else ""
                 if action == "heartbeat":
@@ -897,6 +1049,14 @@ def make_handler(cafe):
                 if action == "launch":
                     cafe.log_launch(pc_id, body.get("game_id"))
                     return self._json({"ok": True})
+                if action == "processes":
+                    cafe.put_processes(pc_id, body.get("list"))
+                    return self._json({"ok": True})
+                if action == "alert":
+                    img = base64.b64decode(body["image"]) if body.get("image") else None
+                    mime = body.get("mime") if img else None
+                    aid = cafe.add_alert(pc_id, body.get("kind", "rule"), body.get("detail", ""), img, mime)
+                    return self._json({"ok": True, "id": aid})
                 if action == "logout":
                     with cafe.lock:
                         s = cafe.active_session(pc_id)
@@ -922,6 +1082,28 @@ def make_handler(cafe):
                     return self._json(s)
                 if method == "POST":
                     return self._json(cafe.update_settings(body))
+
+            if route[:1] == ["pc"] and len(route) == 3 and method == "GET":
+                pc_id, action = route[1], route[2]
+                if action == "screen":
+                    frame = cafe.get_screen(pc_id, qs.get("mode", ["thumb"])[0])
+                    if not frame:
+                        return self._send(204, b"", "text/plain")
+                    return self._send(200, frame["data"], frame["mime"],
+                                      {"X-Frame-Time": f'{frame["ts"]:.3f}'})
+                if action == "processes":
+                    if qs.get("refresh"):
+                        cafe.command(pc_id, "processes")
+                    return self._json(cafe.get_processes(pc_id))
+
+            if route == ["alerts"] and method == "GET":
+                return self._json(cafe.list_alerts(only_open=bool(qs.get("open"))))
+            if route == ["alerts", "ack"] and method == "POST":
+                cafe.ack_alerts(body.get("ids"))
+                return self._json({"ok": True})
+            if route[:1] == ["alerts"] and len(route) == 3 and route[2] == "image" and method == "GET":
+                data, mime = cafe.alert_image(route[1])
+                return self._send(200, data, mime)
 
             if route[:1] == ["pc"] and len(route) >= 2:
                 pc_id, action = route[1], (route[2] if len(route) > 2 else "")

@@ -28,6 +28,9 @@ One master PC controls every gaming PC in the cafe. Staff use a browser dashboar
 | **Game launcher** | When a session starts, the rig shows full-screen tiles for the games installed on it. The customer clicks a tile to play. Staff can also launch a game remotely on one rig or many from the dashboard. |
 | **Rig register** | Records which Steam or EA account is signed in on each rig, which games are installed and hardware notes. Flags rigs that share one account, because those rigs can't play online at the same time. Never stores passwords. |
 | **Packages and group start** | Fixed-price bundles such as "5 hours for ₹250" (charged per rig) or "Race night: 4 rigs × 1 hour for ₹800" (one price, split across the rigs). Tick several rigs and click **Start group** to start them all together, charge once and auto-launch the same game on every rig. **End group** closes them together. |
+| **Remote screen view** | The **Monitor** tab shows live thumbnails of every PC in use. Click one to watch it full size (refreshes about once a second) and see the window or browser tab that's open. From the same screen you can **Lock now**, **Close current app**, **Send warning**, see **Running programs** (and close any of them), restart or shut down the PC. |
+| **Cafe rules** | Set in **Settings › Monitoring & cafe rules**. **Blocked programs** (torrent clients by default) are closed automatically. **Blocked words** in a window or tab title raise an alert. **Blocked websites** become unreachable on every PC. Choose whether a broken rule only alerts staff or locks the PC straight away. |
+| **Alerts log** | Every broken rule is logged with the time, PC, customer and a screenshot of the screen at that moment, for evidence if needed. Screenshots are kept for 7 days. Unreviewed alerts show as a red badge. |
 | **Resilience** | Running sessions survive a server restart because they are stored in SQLite. Commands are sent to each PC once. |
 
 The only requirement is **Python 3.9 or later**. There is nothing to `pip install`.
@@ -79,6 +82,26 @@ The only requirement is **Python 3.9 or later**. There is nothing to `pip instal
 | Race night for 4 friends | Tick the 4 rigs, click **Start group**, choose the "Race night" package and enter the team name. F1 25 opens on all 4 rigs. Then create a private lobby in-game |
 | End-of-day cash tally | **Reports**, then **Download CSV** |
 
+## Monitoring: what to know before you switch it on
+
+**Tell customers.**
+- Every lock screen shows a notice that staff may view the screen and close programs. Keep it there.
+- Also put up a printed notice at the counter, and add a line to your cafe rules or terms.
+- Under India's DPDP Act 2023, screen captures are personal data:
+  - Use them only for safety and rule enforcement.
+  - Restrict dashboard access to authorised staff (change the admin password).
+  - Don't keep screenshots longer than you need. Alert screenshots are deleted automatically after 7 days.
+
+**What each feature can and can't do:**
+
+| Feature | Works well | Limits |
+|---|---|---|
+| Live screen | Desktop, browsers, windowed or borderless games | Some games in exclusive full-screen mode show black. Use borderless-window mode in the game settings. Covers the primary monitor only. |
+| Website blocking | Stops the listed sites at the system level (hosts file) | Needs the agent to run **as administrator**. A browser with "secure DNS" / DNS-over-HTTPS or a VPN can get around it. Turn secure DNS off by policy, and add VPN apps to Blocked programs. For stronger filtering, use a router or DNS filter as well (for example a family DNS service). |
+| Blocked words | Catches page titles such as "… torrent …" | Only sees the window/tab **title**, not the page content. |
+| Blocked programs | Closes torrent clients and similar within about 6 seconds | Matches by program name, so a renamed .exe isn't caught. Also block program installs with a standard (non-admin) Windows account. |
+| Downloads | Torrent apps are closed. Torrent sites can be blocked or flagged | Ordinary browser downloads aren't blocked file by file. Watch the screen, or limit downloads on your router. |
+
 ## Limits of this version
 
 - **The lock screen is not tamper-proof.** It is a full-screen window that stays on top. A determined user can still get past it with `Ctrl+Alt+Del` and Task Manager. For production, lock down each gaming PC's Windows account:
@@ -111,6 +134,8 @@ client/agent.py        Gaming-PC agent (tkinter UI + background heartbeat thread
 tests/test_server.py   End-to-end tests: python3 -m unittest discover -s tests
 ```
 
-**Agent protocol:** the agent sends `POST /api/agent/heartbeat {key, pc_id, name, info}` and gets back `{state: locked|active, session, commands[], games[], server_time}`. Commands are `message`, `lock`, `launch`, `logoff`, `restart` and `shutdown`. The agent reports game starts with `POST /api/agent/launch` so the daily report can show which games were played. The agent works out the clock offset between itself and the server from `server_time`, so the countdown stays correct even if the PC's clock is wrong.
+**Monitoring files:** `client/monitor.py` holds the screen capture (Windows GDI via ctypes, nothing to install), window title, process list, closing programs, rule checks and hosts-file blocking. A PC streams its screen only while someone is watching it on the dashboard.
+
+**Agent protocol:** the agent sends `POST /api/agent/heartbeat {key, pc_id, name, info}` and gets back `{state: locked|active, session, commands[], games[], server_time}`. Commands are `message`, `lock`, `launch`, `kill`, `processes`, `logoff`, `restart` and `shutdown`. The agent reports game starts with `POST /api/agent/launch` so the daily report can show which games were played. The agent works out the clock offset between itself and the server from `server_time`, so the countdown stays correct even if the PC's clock is wrong.
 
 **Data:** stored in `server/data/` as `cafe.db` and `config.json`. Back up this folder.

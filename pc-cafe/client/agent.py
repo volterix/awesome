@@ -27,6 +27,11 @@ import urllib.error
 import urllib.request
 from tkinter import ttk
 
+import base64
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import monitor as mon  # noqa: E402  (sits next to this file)
+
 HERE = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
 CONFIG_PATH = os.path.join(HERE, "agent_config.json")
 HEARTBEAT_EVERY = 2.0
@@ -97,12 +102,120 @@ class Link:
                 self.inbox.put(("offline", str(e)))
             time.sleep(max(0.2, HEARTBEAT_EVERY - (time.time() - t0)))
 
+    def post_raw(self, path, data, content_type, timeout=10):
+        req = urllib.request.Request(self.cfg["server"] + "/api/agent/" + path, data=data, headers={
+            "Content-Type": content_type, "X-Agent-Key": self.cfg["agent_key"], "X-PC-Id": self.cfg["pc_id"]})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+
     def call_async(self, path, payload, tag):
         def run():
             try:
                 self.inbox.put((tag, self.post(path, payload)))
             except Exception as e:
                 self.inbox.put((tag + "_error", str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
+# Monitoring: screen streaming, rule enforcement, site blocking (background threads)
+# --------------------------------------------------------------------------- #
+class Watcher:
+    RULE_EVERY = 3        # seconds between rule checks
+    PROC_EVERY = 6        # seconds between process scans
+    REALERT_AFTER = 120   # don't repeat the same alert within this many seconds
+
+    def __init__(self, cfg, link, inbox):
+        self.cfg, self.link, self.inbox = cfg, link, inbox
+        self.watch, self.policy, self.active = None, {}, False
+        self._sites_applied = None
+        self._recent = {}
+        self._procs, self._procs_ts = [], 0
+
+    def start(self):
+        threading.Thread(target=self._screen_loop, daemon=True).start()
+        threading.Thread(target=self._rules_loop, daemon=True).start()
+
+    def update(self, watch, policy, active):
+        self.watch, self.policy, self.active = watch, policy or {}, active
+
+    # -- live screen ----------------------------------------------------------
+    def _screen_loop(self):
+        while True:
+            mode = self.watch if self.policy.get("screen_view", True) else None
+            if not mode:
+                time.sleep(0.5)
+                continue
+            try:
+                data, mime = mon.capture_screen(1280 if mode == "full" else 480)
+                r = self.link.post_raw("screen", data, mime)
+                self.watch = r.get("watch")
+                time.sleep(1.0 if mode == "full" else 4.0)
+            except Exception as e:
+                print("screen capture/upload failed:", e, flush=True)
+                time.sleep(3)
+
+    # -- rules ----------------------------------------------------------------
+    def _rules_loop(self):
+        while True:
+            try:
+                self._check_rules()
+            except Exception as e:
+                print("rule check failed:", e, flush=True)
+            time.sleep(self.RULE_EVERY)
+
+    def _check_rules(self):
+        fg = mon.foreground()
+        self.link.info["active"] = fg
+        sites = tuple(self.policy.get("blocked_sites") or ())
+        if self.policy and sites != self._sites_applied:
+            err = mon.apply_site_blocks(sites, self.cfg.get("dry_run"))
+            self._sites_applied = sites
+            if err:
+                print(err, flush=True)
+        if not self.active or not self.policy:
+            return
+        if time.time() - self._procs_ts > self.PROC_EVERY:
+            self._procs, self._procs_ts = mon.processes(), time.time()
+        for v in mon.check_policy(self.policy, fg, self._procs):
+            if v["kill"]:
+                mon.kill_process(v["kill"], self.cfg.get("dry_run"))
+                self._procs_ts = 0
+                self.inbox.put(("notice", f"{v['kill']} is not allowed in this cafe and was closed."))
+            key = v["detail"]
+            if time.time() - self._recent.get(key, 0) < self.REALERT_AFTER:
+                continue
+            self._recent[key] = time.time()
+            self._send_alert(v["kind"], v["detail"])
+
+    def _send_alert(self, kind, detail):
+        payload = {"kind": kind, "detail": detail}
+        try:
+            data, mime = mon.capture_screen(960)
+            payload.update(image=base64.b64encode(data).decode(), mime=mime)
+        except Exception:
+            pass
+        try:
+            self.link.post("alert", payload, timeout=15)
+        except Exception as e:
+            print("alert upload failed:", e, flush=True)
+
+    # -- staff commands ---------------------------------------------------------
+    def send_processes(self):
+        def run():
+            try:
+                self.link.post("processes", {"list": mon.processes()}, timeout=15)
+            except Exception as e:
+                print("process list upload failed:", e, flush=True)
+        threading.Thread(target=run, daemon=True).start()
+
+    def kill(self, name):
+        def run():
+            err = mon.kill_process(name, self.cfg.get("dry_run"))
+            if err:
+                print("close app failed:", err, flush=True)
+            time.sleep(1)
+            self.send_processes()
         threading.Thread(target=run, daemon=True).start()
 
 
@@ -165,6 +278,7 @@ class AgentApp:
         self.cfg = cfg
         self.inbox = queue.Queue()
         self.link = Link(cfg, self.inbox)
+        self.watcher = Watcher(cfg, self.link, self.inbox)
         self.session = None
         self.state = "locked"
         self.offset = 0.0              # server_time - local_time
@@ -183,6 +297,7 @@ class AgentApp:
         self.root.bind_all("<Control-Shift-F12>", lambda e: self._staff_exit())
 
         threading.Thread(target=self.link.loop, daemon=True).start()
+        self.watcher.start()
         self.show_lock()
         self.root.after(200, self._pump)
         self.root.after(1000, self._tick)
@@ -215,6 +330,9 @@ class AgentApp:
         self.l_status = tk.Label(box, text="Walk-in? Pay at the counter and staff will unlock this PC.",
                                  font=("Segoe UI", 10), fg=MUTED, bg=PANEL, wraplength=320)
         self.l_status.pack(pady=(8, 0))
+        tk.Label(box, text="Notice: staff may view this PC's screen and close programs\n"
+                           "to keep the cafe safe and enforce cafe rules.",
+                 font=("Segoe UI", 9), fg=MUTED, bg=PANEL, justify="center").pack(pady=(14, 0))
         self.l_conn = tk.Label(self.lock_frame, font=("Segoe UI", 9), fg=MUTED, bg=BG)
         self.l_conn.place(relx=.5, rely=.97, anchor="center")
         for seq in ("<Alt-F4>", "<Escape>", "<Alt-Tab>"):
@@ -473,8 +591,12 @@ class AgentApp:
             self.warned = set()
         self.session = new
         self._apply("active" if new else "locked")
+        self.watcher.update(d.get("watch"), d.get("policy"), bool(new))
         for c in d.get("commands", []):   # after state change, so "launch" sees the new session
             self._run_command(c)
+
+    def _on_notice(self, text):
+        self.popup(text, "Cafe rules", urgent=True)
 
     def _on_offline(self, err):
         if time.time() - self.last_ok > OFFLINE_GRACE:
@@ -510,6 +632,10 @@ class AgentApp:
         elif t == "lock":
             self.session = None
             self._apply("locked")
+        elif t == "processes":
+            self.watcher.send_processes()
+        elif t == "kill":
+            self.watcher.kill(c.get("text", ""))
         elif t == "launch":
             game = next((g for g in self.games if g["id"] == c.get("game_id")), None)
             if game and self.state == "active":
