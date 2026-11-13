@@ -477,5 +477,117 @@ class CafeTest(unittest.TestCase):
         other.close()
         self.assertNotEqual(next(p for p in self.call("/api/state")["pcs"] if p["id"] == "DB-1")["name"], "New name")
 
+    # ---- v5: food & drinks, inventory ------------------------------------------------
+    def fnb_setup(self):
+        noodles = self.call("/api/stock", {"name": "Maggi packet", "unit": "pcs", "qty": 10, "low_level": 3,
+                                           "cost": 12})["id"]
+        masala = self.call("/api/stock", {"name": "Masala mix", "unit": "g", "qty": 100, "low_level": 20,
+                                          "cost": 0.5})["id"]
+        maggi = self.call("/api/menu", {"name": "Masala Maggi", "category": "Snacks", "price": 60,
+                                        "recipe": [{"stock_id": noodles, "qty": 1}, {"stock_id": masala, "qty": 10}]})["id"]
+        coke = self.call("/api/menu", {"name": "Coke 250ml", "category": "Drinks", "price": 40,
+                                       "track_as_stock": True, "opening_qty": 2, "unit_cost": 20, "low_level": 1})["id"]
+        return noodles, masala, maggi, coke
+
+    def stock_of(self, sid):
+        return next(x for x in self.call("/api/stock") if x["id"] == sid)
+
+    def test_fnb_menu_recipes_and_stock(self):
+        noodles, masala, maggi, coke = self.fnb_setup()
+        menu = {m["id"]: m for m in self.call("/api/menu")}
+        self.assertEqual(menu[maggi]["can_make"], 10)
+        self.assertEqual(menu[maggi]["cost"], 17.0)                  # 12 + 10g x 0.5
+        self.assertEqual(menu[coke]["can_make"], 2)                  # packaged item tracked 1:1
+        # purchase updates average cost: 10 @12 + 10 for 160 -> 14
+        self.call(f"/api/stock/{noodles}/in", {"qty": 10, "cost_total": 160})
+        st = self.stock_of(noodles)
+        self.assertEqual((st["qty"], st["cost"]), (20, 14))
+        self.call(f"/api/stock/{noodles}/adjust", {"change": -2, "reason": "waste"})
+        self.call(f"/api/stock/{noodles}/adjust", {"counted": 15, "reason": "adjust"})
+        self.assertEqual(self.stock_of(noodles)["qty"], 15)
+        kinds = [m["kind"] for m in self.call(f"/api/stock/moves?stock_id={noodles}")]
+        self.assertEqual(kinds, ["adjust", "waste", "purchase", "opening"])
+        self.assertEqual(self.call(f"/api/stock/{masala}", method="DELETE")["_status"], 409)  # still in a recipe
+        req = urllib.request.Request(self.base + "/api/stock.csv", headers={"X-Admin-Token": self.token})
+        with urllib.request.urlopen(req) as r:
+            self.assertIn("Maggi packet", r.read().decode("utf-8-sig"))
+
+    def test_fnb_order_from_pc_tab_settles_at_end(self):
+        noodles, masala, maggi, coke = self.fnb_setup()
+        self.agent("FB-1")
+        self.assertEqual(self.agent("FB-1", "order", items=[{"menu_id": coke, "qty": 1}], pay_method="tab")["_status"], 409)
+        self.call("/api/pc/FB-1/start", {"mode": "prepaid", "minutes": 60, "label": "Sam"})
+        self.assertTrue(self.agent("FB-1")["food"]["enabled"])
+        m = self.agent("FB-1", "menu")
+        self.assertEqual(m["methods"][:1], ["tab"])
+        o = self.agent("FB-1", "order", items=[{"menu_id": maggi, "qty": 2}, {"menu_id": coke, "qty": 1}],
+                       pay_method="tab", note="less spicy")
+        self.assertEqual((o["total"], o["status"], o["paid"], o["customer"]), (160, "new", 0, "Sam"))
+        self.assertEqual(self.stock_of(noodles)["qty"], 8)
+        self.assertEqual(self.stock_of(masala)["qty"], 80)
+        # sold out: only 1 coke left
+        r = self.agent("FB-1", "order", items=[{"menu_id": coke, "qty": 2}], pay_method="tab")
+        self.assertEqual(r["_status"], 409)
+        self.assertIn("Coke", r["error"])
+        st = self.call("/api/state")
+        self.assertIn(o["id"], [x["id"] for x in st["orders_active"]])
+        self.assertEqual(next(p for p in st["pcs"] if p["id"] == "FB-1")["session"]["food_tab"], 160)
+        self.call(f"/api/orders/{o['id']}/status", {"status": "preparing"})
+        hb = self.agent("FB-1")
+        self.assertEqual(hb["food"]["orders"][0]["status"], "preparing")
+        self.assertTrue(any("being prepared" in c.get("text", "") for c in hb["commands"]))
+        self.call(f"/api/orders/{o['id']}/status", {"status": "delivered"})
+        self.assertEqual(self.call(f"/api/orders/{o['id']}/status", {"status": "preparing"})["_status"], 409)
+        bill = self.call("/api/pc/FB-1/end", {})["bill"]
+        self.assertEqual((bill["food"], bill["due"]), (160, 160))      # prepaid time + food on the bill
+        rep = self.call("/api/report")["totals"]
+        self.assertGreaterEqual(rep["food_sales"], 160)
+        self.assertGreaterEqual(rep["food_margin"], 160 - 54)        # cost 2x17 + 20
+
+    def test_fnb_member_balance_shortens_session_and_cancel_refunds(self):
+        noodles, masala, maggi, coke = self.fnb_setup()
+        self.agent("FB-2")
+        mid = self.call("/api/members", {"username": "kabir", "password": "pass1", "balance": 120})["id"]
+        self.agent("FB-2", "login", username="kabir", password="pass1")
+        self.assertAlmostEqual(self.agent("FB-2")["session"]["remaining"], 7200, delta=3)
+        self.assertIn("balance", self.agent("FB-2", "menu")["methods"])
+        o = self.agent("FB-2", "order", items=[{"menu_id": maggi, "qty": 1}], pay_method="balance")
+        self.assertEqual(o["paid"], 1)
+        m = next(x for x in self.call("/api/members") if x["id"] == mid)
+        self.assertEqual(m["balance"], 60)
+        self.assertAlmostEqual(self.agent("FB-2")["session"]["remaining"], 3600, delta=3)   # time shrinks with balance
+        r = self.agent("FB-2", "order", items=[{"menu_id": maggi, "qty": 1}], pay_method="balance")
+        self.assertEqual(r["_status"], 402)          # 60 left minus 15 already played (min charge)
+        self.call(f"/api/orders/{o['id']}/status", {"status": "cancelled"})
+        self.assertEqual(next(x for x in self.call("/api/members") if x["id"] == mid)["balance"], 120)
+        self.assertEqual(self.stock_of(noodles)["qty"], 10)          # restocked
+        self.assertAlmostEqual(self.agent("FB-2")["session"]["remaining"], 7200, delta=3)
+        self.agent("FB-2", "logout")
+
+    def test_fnb_upi_order_and_counter_pos(self):
+        self.call("/api/settings", {"payments": {"upi_id": "mycafe@okhdfcbank"}})
+        noodles, masala, maggi, coke = self.fnb_setup()
+        self.agent("FB-3")
+        self.call("/api/pc/FB-3/start", {"mode": "postpaid"})
+        o = self.agent("FB-3", "order", items=[{"menu_id": coke, "qty": 1}], pay_method="upi")
+        self.assertEqual((o["upi"]["amount"], o["upi"]["upi_id"]), (40, "mycafe@okhdfcbank"))
+        self.assertIn(o["id"], [x["id"] for x in self.call("/api/state")["orders_active"]])
+        self.call(f"/api/orders/{o['id']}/paid", {"method": "upi"})
+        self.call(f"/api/orders/{o['id']}/status", {"status": "delivered"})
+        self.assertNotIn(o["id"], [x["id"] for x in self.call("/api/state")["orders_active"]])
+        bill = self.call("/api/pc/FB-3/end", {})["bill"]
+        self.assertNotIn("food", bill)                               # already paid by UPI
+        # counter walk-in, paid in cash on the spot
+        pos = self.call("/api/orders", {"items": [{"menu_id": maggi, "qty": 1}], "pay_method": "cash",
+                                        "customer": "Walk-in"})
+        self.assertEqual((pos["paid"], pos["source"], pos["pc_name"]), (1, "counter", "Counter"))
+        self.assertEqual(self.call("/api/orders", {"items": [{"menu_id": maggi, "qty": 1}],
+                                                   "pay_method": "tab"})["_status"], 400)
+        food = [t for t in self.call("/api/report")["transactions"] if t["kind"] == "food"]
+        self.assertTrue(any(t["note"] == f"Order #{pos['id']}" and t["method"] == "cash" for t in food))
+        # low stock shows up
+        self.call(f"/api/stock/{noodles}/adjust", {"counted": 2})
+        self.assertIn("Maggi packet", [x["name"] for x in self.call("/api/state")["low_stock"]])
+
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,25 @@ textarea{background:var(--bg);border:1px solid var(--line);border-radius:6px;pad
 .payrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:6px 0;border-top:1px solid rgba(46,160,67,.25)}
 .payrow:first-of-type{border-top:0}
 .payrow .amt{font-size:18px;font-weight:650;min-width:80px}
+.subnav{display:flex;gap:4px;margin-bottom:14px}
+.subnav button{background:var(--panel);border:1px solid var(--line);padding:6px 14px;border-radius:6px;cursor:pointer;color:var(--muted)}
+.subnav button.on{color:var(--text);border-color:var(--accent);background:rgba(79,140,255,.12)}
+.kanban{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:20px}
+@media (max-width:900px){.kanban{grid-template-columns:1fr}}
+.col{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;min-height:120px}
+.col h4{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+.ord{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px}
+.ord.new{border-left:3px solid var(--amber)} .ord.preparing{border-left:3px solid var(--accent)} .ord.delivered{border-left:3px solid var(--green)}
+.ord .top{display:flex;justify-content:space-between;gap:8px;font-size:13px}
+.ord ul{margin:6px 0;padding-left:18px;font-size:13px}
+.pay{font-size:11px;padding:1px 7px;border-radius:10px;border:1px solid var(--line)}
+.pay.ok{color:#56d364;border-color:rgba(46,160,67,.5)} .pay.due{color:#e3b341;border-color:rgba(210,153,34,.5)}
+.posgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;max-height:46vh;overflow:auto}
+.positem{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px;cursor:pointer;text-align:left}
+.positem:hover{border-color:var(--accent)} .positem[disabled]{opacity:.4;cursor:not-allowed}
+.positem b{display:block;font-size:13px} .positem span{font-size:12px;color:var(--muted)}
+.lowtag{font-size:11px;padding:1px 7px;border-radius:10px;background:rgba(229,83,75,.15);color:#ff7b72;border:1px solid rgba(229,83,75,.4)}
+.rec{display:flex;gap:6px;margin-bottom:6px}
 .empty{padding:40px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:10px}
 code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break-all}
 @media (max-width:640px){header{padding:10px 16px}main{padding:14px 16px}.kpis{margin-left:0;width:100%}}
@@ -113,6 +132,7 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
     <button data-tab="pcs" class="on">PCs</button>
     <button data-tab="monitor">Monitor<span class="badge hide" id="navAlerts"></span></button>
     <button data-tab="members">Members</button>
+    <button data-tab="fnb">F&amp;B<span class="badge hide" id="navOrders"></span></button>
     <button data-tab="games">Games</button>
     <button data-tab="packages">Packages</button>
     <button data-tab="reports">Reports</button>
@@ -123,6 +143,7 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
     <div class="kpi">Free<b id="kFree">0</b></div>
     <div class="kpi">Offline<b id="kOff">0</b></div>
     <div class="kpi">Cash today<b id="kCash">0</b></div>
+    <div class="kpi" style="cursor:pointer" onclick="openTab('fnb')">Food orders<b id="kOrders">0</b></div>
     <div class="kpi" style="cursor:pointer" onclick="openTab('monitor')">Alerts<b id="kAlerts">0</b></div>
   </div>
 </header>
@@ -180,6 +201,7 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
       <button class="btn" id="rCsv">Download CSV (Excel)</button>
     </div>
     <div class="cards" id="rCards"></div>
+    <div id="rFood"></div>
     <div id="rGames"></div>
     <h3>Sessions</h3>
     <table><thead><tr><th>Start</th><th>End</th><th>PC</th><th>User</th><th>Type</th><th>Package</th><th>Minutes</th><th>Amount</th><th>Ended by</th></tr></thead>
@@ -210,6 +232,43 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
     </div>
     <table><thead><tr><th>Package</th><th>Time</th><th>Rigs</th><th>Price</th><th>Per rig / hr</th><th>Auto-launch</th><th></th></tr></thead>
     <tbody id="pBody"></tbody></table>
+  </section>
+
+  <!-- F&B -->
+  <section id="tab-fnb" class="hide">
+    <div class="bar">
+      <div class="subnav" style="margin:0">
+        <button data-sub="orders" class="on">Orders</button><button data-sub="menu">Menu</button><button data-sub="stock">Inventory<span class="badge hide" id="navLow"></span></button>
+      </div>
+      <span class="sp"></span>
+      <button class="btn pri" id="posBtn">+ Counter order</button>
+    </div>
+    <div id="sub-orders">
+      <div class="kanban">
+        <div class="col"><h4>New</h4><div id="kNew"></div></div>
+        <div class="col"><h4>Preparing</h4><div id="kPrep"></div></div>
+        <div class="col"><h4>Delivered, payment pending</h4><div id="kDue"></div></div>
+      </div>
+      <h3>Today's orders</h3>
+      <table><thead><tr><th>#</th><th>Time</th><th>Where</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Status</th></tr></thead>
+      <tbody id="oBody"></tbody></table>
+    </div>
+    <div id="sub-menu" class="hide">
+      <div class="bar"><span class="muted">What customers see on their PC. Each item uses stock from Inventory — it shows “sold out” automatically when stock runs short.</span>
+        <span class="sp"></span><button class="btn pri" id="menuAdd">+ Menu item</button></div>
+      <table><thead><tr><th>Item</th><th>Category</th><th>Price</th><th>Cost</th><th>Margin</th><th>Uses</th><th>Can make</th><th></th></tr></thead>
+      <tbody id="menuBody"></tbody></table>
+    </div>
+    <div id="sub-stock" class="hide">
+      <div class="bar"><span class="muted">Everything you buy. Sales take stock out automatically; record purchases with <b>Stock in</b>.</span>
+        <span class="sp"></span><button class="btn" id="stockCsv">Download CSV</button><button class="btn pri" id="stockAdd">+ Stock item</button></div>
+      <div class="cards" id="stockCards"></div>
+      <table><thead><tr><th>Item</th><th>In stock</th><th>Reorder at</th><th>Cost / unit</th><th>Stock value</th><th></th></tr></thead>
+      <tbody id="stockBody"></tbody></table>
+      <h3>Stock movements</h3>
+      <table><thead><tr><th>Time</th><th>Item</th><th>Change</th><th>After</th><th>Type</th><th>Reference</th></tr></thead>
+      <tbody id="moveBody"></tbody></table>
+    </div>
   </section>
 
   <!-- Settings -->
@@ -298,6 +357,7 @@ $$('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.tab==='members') loadMembers();
   if (b.dataset.tab==='reports') loadReport();
   if (b.dataset.tab==='settings') loadSettings();
+  if (b.dataset.tab==='fnb') loadFnb();
   if (b.dataset.tab==='monitor'){ renderScreens(); pollThumbs(); loadAlerts() }
   if (b.dataset.tab==='games') renderGames();
   if (b.dataset.tab==='packages') renderPackages();
@@ -322,6 +382,7 @@ function render(){
   if (!$('#tab-monitor').classList.contains('hide')) renderScreens();
   if (viewerId) updateViewerInfo();
   renderPayments();
+  renderOrdersBadge();
   for (const id of [...selected]) if (!pcs.find(p=>p.id===id)) selected.delete(id);
   $('#selCount').textContent = selected.size ? `${selected.size} selected` : '';
   $('#selAll').checked = pcs.length && selected.size === pcs.length;
@@ -353,7 +414,7 @@ function pcCard(p){
       <span class="pc-name">${esc(p.name)}</span><span class="tag">${esc(p.group)}</span>
       <span class="st">${labels[p.status]}</span></div>
     <div class="timer">${timer}${s && s.group_id ? `<span class="grp">${esc(groupName(s))}</span>` : ''}</div><div class="sub">${sub}</div>
-    ${acctLine(p)}${nowLine(p)}
+    ${acctLine(p)}${foodLine(p)}${nowLine(p)}
     <div class="acts">${a.join('')}</div></div>`;
 }
 const gameById = id => state.games.find(g=>g.id===id);
@@ -438,7 +499,8 @@ function showBill(name, b){
   <table><tbody>
    <tr><td>User</td><td>${esc(b.user)}</td></tr><tr><td>Type</td><td>${esc(b.mode)}</td></tr>
    <tr><td>Time used</td><td>${b.minutes_used} min${b.billed_minutes?` (billed ${b.billed_minutes})`:''}</td></tr>
-   <tr><td>Amount</td><td>${money(b.amount)}</td></tr>
+   <tr><td>${b.food ? 'PC time' : 'Amount'}${b.mode==='prepaid' ? ' <span class="muted">(paid at start)</span>' : b.mode==='member' ? ' <span class="muted">(from balance)</span>' : ''}</td><td>${money(b.amount)}</td></tr>
+   ${b.food ? `<tr><td>Food &amp; drinks on bill</td><td>${money(b.food)}</td></tr>` : ''}
    ${b.balance_left!=null?`<tr><td>Balance left</td><td>${money(b.balance_left)}</td></tr>`:''}
    <tr><td><b>Collect now</b></td><td><b style="font-size:20px">${money(b.due)}</b></td></tr>
   </tbody></table>
@@ -662,7 +724,10 @@ async function loadReport(){
     $('#rCards').innerHTML = [['Cash collected', money(t.cash_collected)], ['Walk-in sales', money(t.walkin_sales)],
       ['Member top-ups', money(t.member_topups)], ['Member usage', money(t.member_usage)],
       ['Sessions', t.sessions], ['Hours played', t.hours_played], ['Package sales', money(t.package_sales)],
-      ['Group bookings', t.group_bookings]].map(([k,v])=>`<div class="card"><small>${k}</small><b>${v}</b></div>`).join('');
+      ['Group bookings', t.group_bookings], ['Food sales', money(t.food_sales)], ['Food margin', money(t.food_margin)],
+      ['Food orders', t.food_orders]].map(([k,v])=>`<div class="card"><small>${k}</small><b>${v}</b></div>`).join('');
+    $('#rFood').innerHTML = (r.top_items||[]).length ? `<h3>Food &amp; drinks sold</h3><table style="margin-bottom:16px"><thead><tr><th>Item</th><th>Qty</th><th>Sales</th><th>Margin</th></tr></thead><tbody>${
+      r.top_items.map(i=>`<tr><td>${esc(i.name)}</td><td>${i.qty}</td><td>${money(i.sales)}</td><td>${money(i.margin)}</td></tr>`).join('')}</tbody></table>` : '';
     $('#rGames').innerHTML = r.top_games.length ? `<h3>Games played</h3><table style="margin-bottom:16px"><thead><tr><th>Game</th><th>Launches</th><th>Rigs</th></tr></thead><tbody>${
       r.top_games.map(g=>`<tr><td>${esc(g.name)}</td><td>${g.launches}</td><td>${g.rigs}</td></tr>`).join('')}</tbody></table>` : '';
     const reason = {staff:'Staff', time_up:'Time up', user_logout:'User', locked_by_staff:'Staff lock', shutdown:'Shutdown', restart:'Restart', logoff:'Log off', policy_violation:'Rule broken'};
@@ -726,10 +791,206 @@ function renderPayments(){
 async function approvePay(id){ await act(()=>api(`/topups/${id}/approve`, {body:{}}), 'Approved — time added') }
 async function rejectPay(id){ if (confirm('Reject this payment? The customer is told to see staff.')) await act(()=>api(`/topups/${id}/reject`, {body:{}}), 'Rejected') }
 
+// ---------- F&B ----------
+let fnbSub = 'orders', menuCache = [], stockCache = [], seenOrders = new Set(), firstOrders = true;
+$$('.subnav button').forEach(b => b.onclick = () => { fnbSub = b.dataset.sub;
+  $$('.subnav button').forEach(x => x.classList.toggle('on', x === b));
+  ['orders','menu','stock'].forEach(k => $('#sub-'+k).classList.toggle('hide', k !== fnbSub)); loadFnb() });
+const fnbVisible = () => !$('#tab-fnb').classList.contains('hide');
+const payLabel = o => o.pay_method==='tab' ? (o.paid ? '<span class="pay ok">On bill · settled</span>' : '<span class="pay due">On PC bill</span>')
+  : o.pay_method==='balance' ? '<span class="pay ok">Balance ✓</span>'
+  : o.paid ? `<span class="pay ok">${o.pay_method.toUpperCase()} ✓</span>` : `<span class="pay due">${o.pay_method==='upi'?'UPI':'Cash'} — collect</span>`;
+const ago = ts => { const m = Math.max(0, Math.round((Date.now()/1000 + clockOffset - ts)/60)); return m ? m+' min ago' : 'just now' };
+function renderOrdersBadge(){
+  const act = state.orders_active || [], open = act.filter(o => o.status==='new' || o.status==='preparing');
+  $('#kOrders').textContent = open.length; $('#kOrders').style.color = act.some(o=>o.status==='new') ? 'var(--amber)' : '';
+  $('#navOrders').textContent = open.length; $('#navOrders').classList.toggle('hide', !open.length);
+  $('#navLow').textContent = (state.low_stock||[]).length; $('#navLow').classList.toggle('hide', !(state.low_stock||[]).length);
+  const fresh = act.filter(o => o.status==='new' && !seenOrders.has(o.id));
+  if (fresh.length && !firstOrders){ chime(); toast(`New food order #${fresh[0].id} from ${fresh[0].pc_name}`) }
+  firstOrders = false; act.forEach(o => seenOrders.add(o.id));
+  if (fnbVisible() && fnbSub==='orders') renderKanban();
+}
+function orderCard(o){
+  const b = [];
+  if (o.status==='new') b.push(`<button class="btn sm pri" onclick="setOrder(${o.id},'preparing')">Accept</button>`);
+  if (o.status==='new' || o.status==='preparing') b.push(`<button class="btn sm ok" onclick="setOrder(${o.id},'delivered')">Delivered</button>`);
+  if (!o.paid && (o.pay_method==='cash' || o.pay_method==='upi')){
+    b.push(`<button class="btn sm" onclick="payOrder(${o.id},'cash')">Paid cash</button>`);
+    b.push(`<button class="btn sm" onclick="payOrder(${o.id},'upi')">Paid UPI</button>`) }
+  b.push(`<button class="btn sm danger" onclick="setOrder(${o.id},'cancelled')">Cancel</button>`);
+  return `<div class="ord ${o.status}"><div class="top"><b>#${o.id} · ${esc(o.pc_name)}</b><span class="muted">${ago(o.ts)}</span></div>
+    <div class="muted" style="font-size:12px">${esc(o.customer)}</div>
+    <ul>${o.items.map(i=>`<li>${i.qty} × ${esc(i.name)}</li>`).join('')}</ul>
+    ${o.note?`<div class="warnbox" style="margin:4px 0">Note: ${esc(o.note)}</div>`:''}
+    <div class="top"><b>${money(o.total)}</b>${payLabel(o)}</div><div class="acts">${b.join('')}</div></div>`;
+}
+function renderKanban(){
+  const act = state.orders_active || [];
+  const col = (list, empty) => list.length ? list.map(orderCard).join('') : `<div class="muted" style="font-size:12px;padding:8px">${empty}</div>`;
+  $('#kNew').innerHTML = col(act.filter(o=>o.status==='new'), 'No new orders');
+  $('#kPrep').innerHTML = col(act.filter(o=>o.status==='preparing'), 'Nothing cooking');
+  $('#kDue').innerHTML = col(act.filter(o=>o.status==='delivered'), 'All paid');
+}
+async function setOrder(id, status){
+  if (status==='cancelled' && !confirm(`Cancel order #${id}? Stock goes back and any balance payment is refunded.`)) return;
+  await act(()=>api(`/orders/${id}/status`, {body:{status}}), {preparing:'Accepted', delivered:'Delivered', cancelled:'Cancelled'}[status]);
+  if (fnbSub==='orders') loadOrdersToday();
+}
+async function payOrder(id, method){ await act(()=>api(`/orders/${id}/paid`, {body:{method}}), 'Marked paid'); loadOrdersToday() }
+async function loadFnb(){
+  if (fnbSub==='orders'){ renderKanban(); loadOrdersToday() }
+  if (fnbSub==='menu') loadMenu();
+  if (fnbSub==='stock') loadStock();
+}
+async function loadOrdersToday(){
+  try { const rows = await api('/orders?date=' + todayISO());
+    const st = {new:'New', preparing:'Preparing', delivered:'Delivered', cancelled:'Cancelled'};
+    $('#oBody').innerHTML = rows.length ? rows.map(o=>`<tr><td>${o.id}</td><td>${fmtTime(o.ts)}</td><td>${esc(o.pc_name)}</td><td>${esc(o.customer)}</td>
+      <td>${esc(o.items.map(i=>i.qty+'× '+i.name).join(', '))}</td><td>${money(o.total)}</td><td>${payLabel(o)}</td><td>${st[o.status]}</td></tr>`).join('')
+      : `<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No orders yet today</td></tr>`;
+  } catch(e){ toast(e.message, true) }
+}
+
+// menu
+async function loadMenu(){
+  try { [menuCache, stockCache] = await Promise.all([api('/menu'), api('/stock')]);
+    $('#menuBody').innerHTML = menuCache.length ? menuCache.map(m=>{ const mg = m.price ? Math.round((m.price-m.cost)/m.price*100) : 0;
+      return `<tr><td><b>${esc(m.name)}</b></td><td>${esc(m.category)}</td><td>${money(m.price)}</td><td>${money(m.cost)}</td>
+      <td>${m.cost?mg+'%':'—'}</td><td class="muted" style="font-size:12px">${esc(m.recipe.map(r=>`${r.qty} ${r.unit} ${r.name}`).join(', ')||'not stock-tracked')}</td>
+      <td>${m.can_make==null?'—':m.can_make>0?m.can_make:'<span class="lowtag">Sold out</span>'}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn sm" onclick="menuModal(${m.id})">Edit</button>
+      <button class="btn sm danger" onclick="delMenu(${m.id})">Remove</button></td></tr>` }).join('')
+      : `<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No menu yet. Add stock items first (e.g. Maggi packet), then menu items that use them.</td></tr>`;
+  } catch(e){ toast(e.message, true) }
+}
+function recRow(sid='', qty=''){
+  const d = document.createElement('div'); d.className = 'rec';
+  d.innerHTML = `<select class="rs" style="flex:1">${stockCache.map(s=>`<option value="${s.id}" ${s.id==sid?'selected':''}>${esc(s.name)} (${esc(s.unit)})</option>`).join('')}</select>
+    <input type="number" class="rq" value="${qty}" min="0" step="any" placeholder="qty" style="width:90px"><button class="btn sm danger" type="button">✕</button>`;
+  d.querySelector('button').onclick = () => d.remove(); $('#recRows').appendChild(d);
+}
+async function menuModal(id){
+  if (!stockCache.length) stockCache = await api('/stock');
+  const m = id ? menuCache.find(x=>x.id===id) : {name:'', category:'', price:'', recipe:[]};
+  const cats = [...new Set(menuCache.map(x=>x.category).concat(['Snacks','Drinks','Meals','Combos']))];
+  modal(`<h3>${id?'Edit':'New'} menu item</h3>
+  <div class="row"><label>Name</label><input type="text" id="mn" value="${esc(m.name)}" placeholder="Masala Maggi"></div>
+  <div class="row"><label>Category</label><input type="text" id="mc" list="catList" value="${esc(m.category)}"><datalist id="catList">${cats.map(c=>`<option value="${esc(c)}">`).join('')}</datalist></div>
+  <div class="row"><label>Selling price (${esc(cur())}, incl. GST)</label><input type="number" id="mp" value="${m.price}" min="0"></div>
+  ${id ? '' : `<div class="row"><label>Stock</label><div class="chips" id="mkind">
+    <span class="chip on" data-k="pack">Packaged (chips, cold drink…)</span><span class="chip" data-k="recipe">Made from ingredients</span></div></div>`}
+  <div id="mPack" class="${id?'hide':''}">
+    <div class="row"><label>Buying cost per piece (${esc(cur())})</label><input type="number" id="mu" min="0" step="any"></div>
+    <div class="row"><label>Pieces in stock now</label><input type="number" id="mo" min="0" value="0"></div>
+    <div class="row"><label>Warn me when stock falls to</label><input type="number" id="ml" min="0" value="5"></div></div>
+  <div id="mRec" class="${id?'':'hide'}"><div class="row"><label>Uses per serving (from Inventory)</label><div id="recRows"></div>
+    <button class="btn sm" type="button" onclick="recRow()" style="align-self:flex-start">+ Ingredient</button>
+    ${stockCache.length?'':'<span class="muted" style="font-size:12px">Add ingredients in Inventory first.</span>'}</div></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Save</button></div>`);
+  let kind = id ? 'recipe' : 'pack';
+  (m.recipe||[]).forEach(r=>recRow(r.stock_id, r.qty));
+  $$('#mkind .chip').forEach(c => c.onclick = () => { kind = c.dataset.k; $$('#mkind .chip').forEach(x=>x.classList.toggle('on', x===c));
+    $('#mPack').classList.toggle('hide', kind!=='pack'); $('#mRec').classList.toggle('hide', kind!=='recipe');
+    if (kind==='recipe' && !$$('#recRows .rec').length && stockCache.length) recRow() });
+  $('#go').onclick = async () => {
+    const body = {id, name:$('#mn').value, category:$('#mc').value, price:+$('#mp').value};
+    if (kind==='pack') Object.assign(body, {track_as_stock:true, unit_cost:+$('#mu').value, opening_qty:+$('#mo').value, low_level:+$('#ml').value});
+    else body.recipe = $$('#recRows .rec').map(r=>({stock_id:+r.querySelector('.rs').value, qty:+r.querySelector('.rq').value}));
+    const r = await act(()=>api('/menu', {body}), 'Menu saved'); if (r){ closeModal(); loadMenu() } };
+}
+async function delMenu(id){ if (confirm('Remove this item from the menu? Past sales stay in reports.')) { await act(()=>api(`/menu/${id}`,{method:'DELETE'}), 'Removed'); loadMenu() } }
+$('#menuAdd').onclick = () => menuModal(null);
+
+// inventory
+async function loadStock(){
+  try { const [rows, moves] = await Promise.all([api('/stock'), api('/stock/moves')]); stockCache = rows;
+    const low = rows.filter(r=>r.low), value = rows.reduce((a,r)=>a+r.value,0);
+    $('#stockCards').innerHTML = [['Stock items', rows.length], ['Stock value', money(value)], ['Low stock — reorder', low.length]]
+      .map(([k,v])=>`<div class="card"><small>${k}</small><b ${k.startsWith('Low')&&low.length?'style="color:var(--red)"':''}>${v}</b></div>`).join('');
+    $('#stockBody').innerHTML = rows.length ? rows.map(r=>`<tr ${r.low?'style="background:rgba(229,83,75,.07)"':''}><td><b>${esc(r.name)}</b> ${r.low?'<span class="lowtag">Low</span>':''}</td>
+      <td>${r.qty} ${esc(r.unit)}</td><td>${r.low_level} ${esc(r.unit)}</td><td>${money(r.cost)}</td><td>${money(r.value)}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn sm pri" onclick="stockInModal(${r.id})">Stock in</button>
+      <button class="btn sm" onclick="countModal(${r.id})">Count / waste</button><button class="btn sm" onclick="stockModal(${r.id})">Edit</button>
+      <button class="btn sm danger" onclick="delStock(${r.id})">✕</button></td></tr>`).join('')
+      : `<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">No stock items yet</td></tr>`;
+    const kind = {opening:'Opening', purchase:'Stock in', sale:'Sale', cancel:'Order cancelled', adjust:'Count correction', waste:'Wastage'};
+    $('#moveBody').innerHTML = moves.slice(0,60).map(m=>`<tr><td>${new Date(m.ts*1000).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}</td>
+      <td>${esc(m.name)}</td><td style="color:${m.change<0?'#ff7b72':'#56d364'}">${m.change>0?'+':''}${m.change} ${esc(m.unit)}</td><td>${m.qty_after}</td>
+      <td>${kind[m.kind]||esc(m.kind)}</td><td class="muted">${esc(m.ref||m.note||'')}</td></tr>`).join('')
+      || `<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">No movements yet</td></tr>`;
+  } catch(e){ toast(e.message, true) }
+}
+function stockModal(id){
+  const r = id ? stockCache.find(x=>x.id===id) : {name:'', unit:'pcs', low_level:5, cost:''};
+  modal(`<h3>${id?'Edit':'New'} stock item</h3>
+  <div class="row"><label>Name</label><input type="text" id="sn" value="${esc(r.name)}" placeholder="Maggi packet, Milk, Coke 250ml…"></div>
+  <div class="row"><label>Unit</label><input type="text" id="su" value="${esc(r.unit)}" list="unitList"><datalist id="unitList"><option value="pcs"><option value="g"><option value="ml"><option value="kg"><option value="L"></datalist></div>
+  <div class="row"><label>Cost per unit (${esc(cur())})</label><input type="number" id="sc" value="${r.cost}" min="0" step="any"></div>
+  <div class="row"><label>Reorder when stock falls to</label><input type="number" id="sl" value="${r.low_level}" min="0" step="any"></div>
+  ${id?'':`<div class="row"><label>Quantity in stock now</label><input type="number" id="sq" value="0" min="0" step="any"></div>`}
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Save</button></div>`);
+  $('#go').onclick = async () => { const res = await act(()=>api('/stock', {body:{id, name:$('#sn').value, unit:$('#su').value, cost:+$('#sc').value,
+    low_level:+$('#sl').value, qty: id ? undefined : +$('#sq').value}}), 'Saved'); if (res){ closeModal(); loadStock() } };
+}
+function stockInModal(id){
+  const r = stockCache.find(x=>x.id===id);
+  modal(`<h3>Stock in · ${esc(r.name)}</h3><p class="muted" style="margin-top:-6px">Now: ${r.qty} ${esc(r.unit)}</p>
+  <div class="row"><label>Quantity received (${esc(r.unit)})</label><input type="number" id="iq" min="0" step="any"></div>
+  <div class="row"><label>Total paid for it (${esc(cur())}) — updates average cost; leave blank to keep ${money(r.cost)}/${esc(r.unit)}</label><input type="number" id="ic" min="0" step="any"></div>
+  <div class="row"><label>Note (supplier, bill no.)</label><input type="text" id="in"></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Add stock</button></div>`);
+  $('#go').onclick = async () => { const res = await act(()=>api(`/stock/${id}/in`, {body:{qty:+$('#iq').value, cost_total:$('#ic').value===''?null:+$('#ic').value, note:$('#in').value}}), 'Stock added'); if (res){ closeModal(); loadStock() } };
+}
+function countModal(id){
+  const r = stockCache.find(x=>x.id===id);
+  modal(`<h3>${esc(r.name)}</h3><p class="muted" style="margin-top:-6px">System says ${r.qty} ${esc(r.unit)}</p>
+  <div class="row"><label>Actual count after physical check (${esc(r.unit)})</label><input type="number" id="cq" min="0" step="any"></div>
+  <div class="row"><label>— or — Wasted / damaged / expired (${esc(r.unit)})</label><input type="number" id="cw" min="0" step="any"></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Save</button></div>`);
+  $('#go').onclick = async () => { const counted = $('#cq').value, waste = $('#cw').value;
+    const body = counted!=='' ? {counted:+counted, reason:'adjust'} : {change:-Math.abs(+waste), reason:'waste'};
+    const res = await act(()=>api(`/stock/${id}/adjust`, {body}), 'Updated'); if (res){ closeModal(); loadStock() } };
+}
+async function delStock(id){ if (confirm('Remove this stock item?')) { await act(()=>api(`/stock/${id}`,{method:'DELETE'}), 'Removed'); loadStock() } }
+$('#stockAdd').onclick = () => stockModal(null);
+$('#stockCsv').onclick = async () => { const r = await fetch('/api/stock.csv', {headers:{'X-Admin-Token':token}});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(await r.blob()); a.download = 'cafe-inventory.csv'; a.click() };
+
+// counter POS
+$('#posBtn').onclick = async () => {
+  menuCache = await api('/menu');
+  if (!menuCache.length) return toast('Add menu items first (F&B › Menu)', true);
+  const cart = {};
+  const inUse = state.pcs.filter(p=>p.session);
+  modal(`<h3>Counter order</h3>
+  <div class="posgrid">${menuCache.map(m=>`<button class="positem" data-id="${m.id}" ${m.available?'':'disabled'}><b>${esc(m.name)}</b><span>${money(m.price)}${m.available?'':' · sold out'}</span></button>`).join('')}</div>
+  <div id="cart" style="margin-top:12px"></div>
+  <div class="row" style="margin-top:10px"><label>For</label><select id="posFor"><option value="">Counter / walk-in</option>${inUse.map(p=>`<option value="${p.id}">${esc(p.name)} · ${esc(p.session.user)}</option>`).join('')}</select></div>
+  <div class="row"><label>Payment</label><select id="posPay"><option value="cash">Cash — paid now</option><option value="upi">UPI — paid now</option><option value="tab">Add to PC bill (pay at End &amp; bill)</option></select></div>
+  <div class="foot"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="go">Place order</button></div>`);
+  $('#modal').classList.add('wide');
+  const draw = () => { const ids = Object.keys(cart).filter(k=>cart[k]>0);
+    const tot = ids.reduce((a,k)=>a+menuCache.find(m=>m.id==k).price*cart[k],0);
+    $('#cart').innerHTML = ids.length ? `<table><tbody>${ids.map(k=>{ const m = menuCache.find(x=>x.id==k);
+      return `<tr><td>${esc(m.name)}</td><td style="white-space:nowrap"><button class="btn sm" data-dec="${k}">−</button> ${cart[k]} <button class="btn sm" data-inc="${k}">+</button></td><td>${money(m.price*cart[k])}</td></tr>` }).join('')}
+      <tr><td><b>Total</b></td><td></td><td><b>${money(tot)}</b></td></tr></tbody></table>` : '<div class="muted">Tap items to add them</div>';
+    $$('#cart [data-inc]').forEach(b=>b.onclick=()=>{cart[b.dataset.inc]++; draw()}); $$('#cart [data-dec]').forEach(b=>b.onclick=()=>{cart[b.dataset.dec]--; draw()}) };
+  $$('.positem').forEach(b => b.onclick = () => { cart[b.dataset.id] = (cart[b.dataset.id]||0)+1; draw() }); draw();
+  $('#go').onclick = async () => { const items = Object.entries(cart).filter(([,q])=>q>0).map(([k,q])=>({menu_id:+k, qty:q}));
+    if (!items.length) return toast('Cart is empty', true);
+    const pc = $('#posFor').value, sel = pc ? pcById(pc) : null;
+    const r = await act(()=>api('/orders', {body:{items, pay_method:$('#posPay').value, pc_id:pc||null,
+      customer: sel ? sel.session.user : 'Walk-in', paid_now:true}}), 'Order placed');
+    if (r){ closeModal(); if (fnbVisible()) loadFnb() } };
+};
+
 // ---------- monitor: live screens ----------
 const thumbs = {};          // pc_id -> object URL of latest thumbnail
 let viewerId = null, viewerTimer = null, viewerUrl = null;
 function openTab(name){ $(`nav button[data-tab=${name}]`).click() }
+function foodLine(p){ const t = p.session && p.session.food_tab;
+  return t ? `<div class="now">🍔 Food on bill: ${money(t)}</div>` : '' }
 function nowLine(p){
   const a = p.activity || {};
   if (!p.online || !(a.title || a.app)) return '';

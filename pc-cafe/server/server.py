@@ -155,6 +155,23 @@ class Cafe:
             CREATE TABLE IF NOT EXISTS packages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, minutes INTEGER,
                 price REAL, rigs INTEGER DEFAULT 1, game_id INTEGER, active INTEGER DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS stock_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, unit TEXT DEFAULT 'pcs',
+                qty REAL DEFAULT 0, low_level REAL DEFAULT 0, cost REAL DEFAULT 0, active INTEGER DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS stock_moves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, stock_id INTEGER, change REAL,
+                kind TEXT, ref TEXT, note TEXT, cost_total REAL DEFAULT 0, qty_after REAL);
+            CREATE TABLE IF NOT EXISTS menu_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, category TEXT, price REAL,
+                active INTEGER DEFAULT 1, sort INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS recipes (
+                menu_id INTEGER, stock_id INTEGER, qty REAL, PRIMARY KEY (menu_id, stock_id));
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, pc_id TEXT, pc_name TEXT, session_id INTEGER,
+                member_id INTEGER, customer TEXT, source TEXT, status TEXT DEFAULT 'new', total REAL,
+                cost REAL, pay_method TEXT, paid INTEGER DEFAULT 0, paid_ts REAL, note TEXT, updated REAL);
+            CREATE TABLE IF NOT EXISTS order_items (
+                order_id INTEGER, menu_id INTEGER, name TEXT, qty INTEGER, price REAL, cost REAL);
             CREATE TABLE IF NOT EXISTS topups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, pc_id TEXT, pc_name TEXT,
                 session_id INTEGER, member_id INTEGER, user_label TEXT, kind TEXT, minutes INTEGER,
@@ -474,12 +491,16 @@ class Cafe:
                     bill.update(amount=amount, due=amount)
             self.db.execute("UPDATE sessions SET ended=?, minutes=?, amount=?, end_reason=? WHERE id=?",
                             (t, round(used_sec / 60, 2), amount, reason, s["id"]))
+            food = self._settle_food_tab(s["id"])
+            if food:
+                bill["food"] = food
+                bill["due"] = round(bill.get("due", 0) + food, 2)
             self.db.commit()
             self.queue_command(pc_id, {"type": "lock"})
             if bill.get("due"):
                 self.queue_command(pc_id, {"type": "message",
                                            "text": f"Session ended. Please pay {self.cfg['currency']}"
-                                                   f"{amount:.0f} at the counter."})
+                                                   f"{bill['due']:.0f} at the counter."})
             return bill
 
     def tick(self):
@@ -515,6 +536,9 @@ class Cafe:
         if s["mode"] == "member":
             m = self.db.execute("SELECT balance FROM members WHERE id=?", (s["member_id"],)).fetchone()
             out["balance"] = m["balance"] if m else 0
+        tab = self.db.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE session_id=? AND pay_method='tab'"
+                              " AND paid=0 AND status!='cancelled'", (s["id"],)).fetchone()[0]
+        out["food_tab"] = round(tab, 2)
         return out
 
     # ---- transactions -------------------------------------------------------
@@ -591,6 +615,7 @@ class Cafe:
                 "games": self.games_for_pc(pc_id),
                 "watch": self.watch_mode(pc_id), "policy": self.policy(),
                 "timeup": self._section("timeup"), "topup": self.topup_info(pc_id),
+                "food": {"enabled": self.food_enabled(), "orders": self.pc_orders(pc_id)},
             }
 
     def update_pc(self, pc_id, data):
@@ -656,7 +681,358 @@ class Cafe:
                     "games": self.list_games(), "packages": self.list_packages(),
                     "alerts_open": self.db.execute("SELECT COUNT(*) FROM alerts WHERE acked=0").fetchone()[0],
                     "topups_pending": self.list_topups("pending"),
+                    "orders_active": self.list_orders(active=True),
+                    "low_stock": [dict(r) for r in self.db.execute(
+                        "SELECT id, name, unit, qty, low_level FROM stock_items"
+                        " WHERE active=1 AND qty<=low_level ORDER BY name")],
                     "today": self.report(dt.date.today().isoformat())["totals"]}
+
+    # ---- F&B: inventory -------------------------------------------------------------
+    def _stock(self, stock_id):
+        r = self.db.execute("SELECT * FROM stock_items WHERE id=?", (int(stock_id),)).fetchone()
+        if not r:
+            raise ApiError(404, "Stock item not found")
+        return r
+
+    def _move(self, stock_id, change, kind, ref="", note="", cost_total=0.0):
+        self.db.execute("UPDATE stock_items SET qty=ROUND(qty+?, 3) WHERE id=?", (change, stock_id))
+        after = self.db.execute("SELECT qty FROM stock_items WHERE id=?", (stock_id,)).fetchone()[0]
+        self.db.execute("INSERT INTO stock_moves (ts, stock_id, change, kind, ref, note, cost_total, qty_after)"
+                        " VALUES (?,?,?,?,?,?,?,?)", (now(), stock_id, change, kind, ref, note[:200],
+                                                      round(cost_total, 2), after))
+
+    def list_stock(self):
+        with self.lock:
+            rows = [dict(r) for r in self.db.execute("SELECT * FROM stock_items WHERE active=1 ORDER BY name")]
+            for r in rows:
+                r["low"] = r["qty"] <= r["low_level"]
+                r["value"] = round(r["qty"] * r["cost"], 2)
+            return rows
+
+    def save_stock(self, data):
+        name = str(data.get("name", "")).strip()[:60]
+        if not name:
+            raise ApiError(400, "Name is required")
+        unit = str(data.get("unit") or "pcs").strip()[:12]
+        low, cost = float(data.get("low_level") or 0), float(data.get("cost") or 0)
+        if low < 0 or cost < 0:
+            raise ApiError(400, "Values can't be negative")
+        with self.lock:
+            if data.get("id"):
+                self._stock(data["id"])
+                self.db.execute("UPDATE stock_items SET name=?, unit=?, low_level=?, cost=? WHERE id=?",
+                                (name, unit, low, cost, int(data["id"])))
+                sid = int(data["id"])
+            else:
+                sid = self.db.execute("INSERT INTO stock_items (name, unit, qty, low_level, cost) VALUES (?,?,0,?,?)",
+                                      (name, unit, low, cost)).lastrowid
+                opening = float(data.get("qty") or 0)
+                if opening:
+                    self._move(sid, opening, "opening", note="Opening stock", cost_total=opening * cost)
+            self.db.commit()
+            return sid
+
+    def stock_in(self, stock_id, qty, cost_total=None, note=""):
+        """Record a purchase. Updates the average cost per unit when a total cost is given."""
+        qty = float(qty or 0)
+        if qty <= 0:
+            raise ApiError(400, "Quantity must be more than zero")
+        with self.lock:
+            st = self._stock(stock_id)
+            if cost_total not in (None, ""):
+                cost_total = float(cost_total)
+                if cost_total < 0:
+                    raise ApiError(400, "Cost can't be negative")
+                held = max(st["qty"], 0)
+                avg = (held * st["cost"] + cost_total) / (held + qty)
+                self.db.execute("UPDATE stock_items SET cost=? WHERE id=?", (round(avg, 4), st["id"]))
+            else:
+                cost_total = qty * st["cost"]
+            self._move(st["id"], qty, "purchase", note=note or "Stock in", cost_total=cost_total)
+            self.db.commit()
+
+    def adjust_stock(self, stock_id, counted=None, change=None, reason="adjust"):
+        """Stock count correction (counted) or wastage/breakage (negative change)."""
+        if reason not in ("adjust", "waste"):
+            raise ApiError(400, "Reason must be adjust or waste")
+        with self.lock:
+            st = self._stock(stock_id)
+            delta = float(counted) - st["qty"] if counted not in (None, "") else float(change or 0)
+            if delta == 0:
+                return
+            self._move(st["id"], delta, reason, note="Stock count" if counted not in (None, "") else "Wastage",
+                       cost_total=abs(delta) * st["cost"])
+            self.db.commit()
+
+    def delete_stock(self, stock_id):
+        with self.lock:
+            self._stock(stock_id)
+            if self.db.execute("SELECT 1 FROM recipes r JOIN menu_items m ON m.id=r.menu_id"
+                               " WHERE r.stock_id=? AND m.active=1", (int(stock_id),)).fetchone():
+                raise ApiError(409, "A menu item still uses this. Remove it from the menu item first.")
+            self.db.execute("UPDATE stock_items SET active=0 WHERE id=?", (int(stock_id),))
+            self.db.commit()
+
+    def stock_moves(self, stock_id=None, limit=200):
+        with self.lock:
+            q = ("SELECT m.*, s.name, s.unit FROM stock_moves m JOIN stock_items s ON s.id=m.stock_id")
+            args = []
+            if stock_id:
+                q += " WHERE m.stock_id=?"
+                args.append(int(stock_id))
+            return [dict(r) for r in self.db.execute(q + " ORDER BY m.id DESC LIMIT ?", args + [int(limit)])]
+
+    # ---- F&B: menu --------------------------------------------------------------------
+    def food_enabled(self):
+        return bool(self.db.execute("SELECT 1 FROM menu_items WHERE active=1 LIMIT 1").fetchone())
+
+    def _recipe(self, menu_id):
+        return [dict(r) for r in self.db.execute(
+            "SELECT r.stock_id, r.qty, s.name, s.unit, s.qty AS in_stock, s.cost FROM recipes r"
+            " JOIN stock_items s ON s.id=r.stock_id WHERE r.menu_id=?", (menu_id,))]
+
+    def list_menu(self, include_inactive=False):
+        with self.lock:
+            q = "SELECT * FROM menu_items" + ("" if include_inactive else " WHERE active=1")
+            items = [dict(r) for r in self.db.execute(q + " ORDER BY category COLLATE NOCASE, sort, name")]
+            for it in items:
+                rec = self._recipe(it["id"])
+                it["recipe"] = [{"stock_id": r["stock_id"], "qty": r["qty"], "name": r["name"], "unit": r["unit"]}
+                                for r in rec]
+                # how many can still be made from current stock (None = not stock-tracked)
+                it["can_make"] = (min(int(r["in_stock"] // r["qty"]) for r in rec if r["qty"] > 0)
+                                  if rec else None)
+                it["available"] = it["can_make"] is None or it["can_make"] > 0
+                it["cost"] = round(sum(r["qty"] * r["cost"] for r in rec), 2)
+            return items
+
+    def save_menu(self, data):
+        name = str(data.get("name", "")).strip()[:60]
+        price = float(data.get("price") or 0)
+        if not name or price < 0:
+            raise ApiError(400, "Menu item needs a name and a price")
+        category = str(data.get("category") or "Snacks").strip()[:30]
+        recipe = data.get("recipe") or []
+        with self.lock:
+            if data.get("track_as_stock"):      # packaged item: create a stock item with the same name
+                sid = self.save_stock({"name": name, "unit": data.get("unit") or "pcs",
+                                       "qty": data.get("opening_qty") or 0,
+                                       "low_level": data.get("low_level") or 0, "cost": data.get("unit_cost") or 0})
+                recipe = [{"stock_id": sid, "qty": 1}]
+            clean = {}
+            for r in recipe:
+                q = float(r.get("qty") or 0)
+                if q > 0:
+                    self._stock(r["stock_id"])
+                    clean[int(r["stock_id"])] = q
+            if data.get("id"):
+                mid = int(data["id"])
+                if not self.db.execute("SELECT 1 FROM menu_items WHERE id=?", (mid,)).fetchone():
+                    raise ApiError(404, "Menu item not found")
+                self.db.execute("UPDATE menu_items SET name=?, category=?, price=?, active=1 WHERE id=?",
+                                (name, category, round(price, 2), mid))
+            else:
+                mid = self.db.execute("INSERT INTO menu_items (name, category, price) VALUES (?,?,?)",
+                                      (name, category, round(price, 2))).lastrowid
+            if "recipe" in data or data.get("track_as_stock"):
+                self.db.execute("DELETE FROM recipes WHERE menu_id=?", (mid,))
+                self.db.executemany("INSERT INTO recipes (menu_id, stock_id, qty) VALUES (?,?,?)",
+                                    [(mid, k, v) for k, v in clean.items()])
+            self.db.commit()
+            return mid
+
+    def delete_menu(self, menu_id):
+        with self.lock:
+            self.db.execute("UPDATE menu_items SET active=0 WHERE id=?", (int(menu_id),))
+            self.db.commit()
+
+    # ---- F&B: orders ------------------------------------------------------------------
+    PAY_METHODS = ("tab", "balance", "upi", "cash")
+
+    def place_order(self, items, pay_method, pc_id=None, source="pc", note="", customer="", paid_now=False):
+        """Create an order and take the ingredients out of stock.
+
+        pay_method: tab (added to the PC bill, paid at End & bill), balance (member balance, paid now),
+                    upi / cash (paid to staff; paid_now=True when the counter takes the money immediately).
+        """
+        if pay_method not in self.PAY_METHODS:
+            raise ApiError(400, "Unknown payment method")
+        want = {}
+        for it in items or []:
+            q = int(it.get("qty") or 0)
+            if q > 0:
+                want[int(it["menu_id"])] = want.get(int(it["menu_id"]), 0) + q
+        if not want or sum(want.values()) > 50:
+            raise ApiError(400, "Add between 1 and 50 items")
+        with self.lock:
+            s, pc_name = None, "Counter"
+            if pc_id:
+                pc_name = self._pc(pc_id)["name"]
+                s = self.active_session(pc_id)
+                if source == "pc" and not s:
+                    raise ApiError(409, "Ordering is available during a session")
+            if pay_method in ("tab", "balance") and not s:
+                raise ApiError(400, "Add-to-bill and balance payment need a running session on a PC")
+            if pay_method == "balance" and s["mode"] != "member":
+                raise ApiError(400, "Balance payment is for member logins")
+            lines, need, total, cost = [], {}, 0.0, 0.0
+            for mid, q in want.items():
+                m = self.db.execute("SELECT * FROM menu_items WHERE id=? AND active=1", (mid,)).fetchone()
+                if not m:
+                    raise ApiError(404, "A menu item is no longer available")
+                rec = self._recipe(mid)
+                unit_cost = sum(r["qty"] * r["cost"] for r in rec)
+                for r in rec:
+                    need[r["stock_id"]] = need.get(r["stock_id"], 0) + r["qty"] * q
+                lines.append((mid, m["name"], q, m["price"], round(unit_cost, 2)))
+                total += m["price"] * q
+                cost += unit_cost * q
+            short = [self._stock(sid)["name"] for sid, q in need.items() if self._stock(sid)["qty"] + 1e-9 < q]
+            if short:
+                raise ApiError(409, "Sold out: " + ", ".join(short))
+            total, cost = round(total, 2), round(cost, 2)
+            if pay_method == "balance":
+                bal = self.db.execute("SELECT balance FROM members WHERE id=?", (s["member_id"],)).fetchone()[0]
+                playing = self.cost(s["rate"], self.billable_minutes(now() - s["started"]))
+                if bal - playing < total:
+                    raise ApiError(402, f"Not enough balance (available {self.cfg['currency']}"
+                                        f"{max(bal - playing, 0):.0f}). Choose another way to pay.")
+            paid = pay_method == "balance" or (paid_now and pay_method in ("cash", "upi"))
+            cur = self.db.execute(
+                "INSERT INTO orders (ts, pc_id, pc_name, session_id, member_id, customer, source, total, cost,"
+                " pay_method, paid, paid_ts, note, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (now(), pc_id, pc_name, s["id"] if s else None, s["member_id"] if s else None,
+                 (customer or (s["user_label"] if s else "Walk-in"))[:40], source, total, cost, pay_method,
+                 int(paid), now() if paid else None, str(note or "")[:200], now()))
+            oid = cur.lastrowid
+            self.db.executemany("INSERT INTO order_items (order_id, menu_id, name, qty, price, cost) VALUES (?,?,?,?,?,?)",
+                                [(oid,) + ln for ln in lines])
+            for sid, q in need.items():
+                self._move(sid, -q, "sale", ref=f"Order #{oid}")
+            if pay_method == "balance":
+                self.db.execute("UPDATE members SET balance=balance-? WHERE id=?", (total, s["member_id"]))
+                self._txn("food_balance", total, member_id=s["member_id"], session_id=s["id"], pc_id=pc_id,
+                          method="balance", note=f"Order #{oid}")
+                self._sync_member_end(s["member_id"])
+            elif paid:
+                self._txn("food", total, session_id=s["id"] if s else None, pc_id=pc_id, method=pay_method,
+                          note=f"Order #{oid}")
+            self.db.commit()
+            return self.get_order(oid)
+
+    def get_order(self, oid):
+        o = self.db.execute("SELECT * FROM orders WHERE id=?", (int(oid),)).fetchone()
+        if not o:
+            raise ApiError(404, "Order not found")
+        out = dict(o)
+        out["items"] = [dict(r) for r in self.db.execute(
+            "SELECT menu_id, name, qty, price FROM order_items WHERE order_id=?", (o["id"],))]
+        return out
+
+    def list_orders(self, active=False, day=None, limit=100):
+        q, args = "SELECT id FROM orders", []
+        if active:
+            q += " WHERE status IN ('new','preparing') OR (pay_method IN ('cash','upi') AND paid=0" \
+                 " AND status!='cancelled')"
+        elif day:
+            start = time.mktime(dt.date.fromisoformat(day).timetuple())
+            q += " WHERE ts>=? AND ts<?"
+            args += [start, start + 86400]
+        return [self.get_order(r[0]) for r in self.db.execute(q + " ORDER BY id DESC LIMIT ?", args + [int(limit)])]
+
+    def pc_orders(self, pc_id):
+        """Orders the customer at this PC should still see (open, or finished in the last 10 minutes)."""
+        rows = self.db.execute("SELECT id FROM orders WHERE pc_id=? AND source='pc' AND (status IN ('new','preparing')"
+                               " OR updated>?) ORDER BY id DESC LIMIT 5", (pc_id, now() - 600)).fetchall()
+        return [{k: o[k] for k in ("id", "status", "total", "pay_method", "paid")}
+                for o in (self.get_order(r[0]) for r in rows)]
+
+    def set_order_status(self, oid, status):
+        flow = {"new": ("preparing", "delivered", "cancelled"), "preparing": ("delivered", "cancelled"),
+                "delivered": ("cancelled",)}
+        with self.lock:
+            o = self.get_order(oid)
+            if status not in flow.get(o["status"], ()):
+                raise ApiError(409, f"Order is {o['status']}; can't change it to {status}")
+            if status == "cancelled":
+                self._cancel_order(o)
+            self.db.execute("UPDATE orders SET status=?, updated=? WHERE id=?", (status, now(), o["id"]))
+            self.db.commit()
+            if o["pc_id"] and o["source"] == "pc":
+                msg = {"preparing": f"Your order #{o['id']} is being prepared.",
+                       "cancelled": f"Sorry, your order #{o['id']} was cancelled. Please see staff."}.get(status)
+                if msg:
+                    self.queue_command(o["pc_id"], {"type": "message", "text": msg})
+            return self.get_order(o["id"])
+
+    def _cancel_order(self, o):
+        for r in self.db.execute("SELECT menu_id, qty FROM order_items WHERE order_id=?", (o["id"],)).fetchall():
+            for rec in self.db.execute("SELECT stock_id, qty FROM recipes WHERE menu_id=?", (r["menu_id"],)).fetchall():
+                self._move(rec["stock_id"], rec["qty"] * r["qty"], "cancel", ref=f"Order #{o['id']}")
+        if o["paid"] and o["pay_method"] == "balance":
+            self.db.execute("UPDATE members SET balance=balance+? WHERE id=?", (o["total"], o["member_id"]))
+            self._txn("food_balance", -o["total"], member_id=o["member_id"], pc_id=o["pc_id"], method="balance",
+                      note=f"Refund order #{o['id']}")
+            self._sync_member_end(o["member_id"])
+        elif o["paid"]:
+            self._txn("food_refund", -o["total"], pc_id=o["pc_id"], method=o["pay_method"],
+                      note=f"Refund order #{o['id']}")
+
+    def mark_order_paid(self, oid, method="cash"):
+        if method not in ("cash", "upi"):
+            raise ApiError(400, "Method must be cash or upi")
+        with self.lock:
+            o = self.get_order(oid)
+            if o["paid"] or o["status"] == "cancelled":
+                raise ApiError(409, "Order is already paid or cancelled")
+            self.db.execute("UPDATE orders SET paid=1, paid_ts=?, pay_method=?, updated=? WHERE id=?",
+                            (now(), method, now(), o["id"]))
+            self._txn("food", o["total"], session_id=o["session_id"], pc_id=o["pc_id"], method=method,
+                      note=f"Order #{o['id']}")
+            self.db.commit()
+
+    def _settle_food_tab(self, session_id):
+        """At End & bill: unpaid 'add to bill' orders become due at the counter."""
+        rows = self.db.execute("SELECT id, total, pc_id FROM orders WHERE session_id=? AND pay_method='tab'"
+                               " AND paid=0 AND status!='cancelled'", (session_id,)).fetchall()
+        for r in rows:
+            self.db.execute("UPDATE orders SET paid=1, paid_ts=?, updated=? WHERE id=?", (now(), now(), r["id"]))
+            self._txn("food", r["total"], session_id=session_id, pc_id=r["pc_id"], method="cash",
+                      note=f"Order #{r['id']} (on bill)")
+        return round(sum(r["total"] for r in rows), 2)
+
+    def pc_menu(self, pc_id):
+        """Menu + payment choices for the customer at this PC."""
+        with self.lock:
+            s = self.active_session(pc_id)
+            pay = self._section("payments")
+            methods = []
+            if s:
+                methods.append("tab")
+                if s["mode"] == "member":
+                    methods.append("balance")
+            if pay["upi_id"]:
+                methods.append("upi")
+            methods.append("cash")
+            items = [{k: it[k] for k in ("id", "name", "category", "price", "available", "can_make")}
+                     for it in self.list_menu()]
+            return {"items": items, "methods": methods, "currency": self.cfg["currency"]}
+
+    def upi_details(self, amount, note):
+        pay = self._section("payments")
+        if not pay["upi_id"]:
+            return {}
+        return {"upi_id": pay["upi_id"], "payee": pay["payee_name"] or self.cfg["cafe_name"],
+                "amount": amount, "note": note[:60]}
+
+    def stock_csv(self):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["Item", "Unit", "In stock", "Low level", "Cost per unit", "Stock value", "Status"])
+        for r in self.list_stock():
+            w.writerow([r["name"], r["unit"], r["qty"], r["low_level"], r["cost"], r["value"],
+                        "LOW - reorder" if r["low"] else "OK"])
+        return buf.getvalue()
 
     # ---- top-ups from the PC (UPI QR or pay at counter, confirmed by staff) -------
     def _topup_kind(self, pc_id):
@@ -1006,14 +1382,16 @@ class Cafe:
             self.db.execute("UPDATE members SET balance=balance+? WHERE id=?", (amount, member_id))
             self._txn("topup" if amount > 0 else "refund", amount, member_id=member_id,
                       method=method, note=m["username"])
-            # extend an active member session to match the new balance
-            s = self.db.execute("SELECT * FROM sessions WHERE member_id=? AND ended IS NULL",
-                                (member_id,)).fetchone()
-            if s and s["rate"] > 0:
-                new_bal = m["balance"] + amount
-                self.db.execute("UPDATE sessions SET ends=? WHERE id=?",
-                                (s["started"] + new_bal / s["rate"] * 3600, s["id"]))
+            self._sync_member_end(member_id)   # extend an active member session to match the new balance
             self.db.commit()
+
+    def _sync_member_end(self, member_id):
+        """A member's session runs until their balance is used up; recompute after the balance changes."""
+        s = self.db.execute("SELECT * FROM sessions WHERE member_id=? AND ended IS NULL", (member_id,)).fetchone()
+        m = self.db.execute("SELECT balance FROM members WHERE id=?", (member_id,)).fetchone()
+        if s and m and s["rate"] > 0:
+            self.db.execute("UPDATE sessions SET ends=? WHERE id=?",
+                            (s["started"] + max(m["balance"], 0) / s["rate"] * 3600, s["id"]))
 
     def reset_member_password(self, member_id, password):
         if len(str(password)) < 4:
@@ -1050,11 +1428,19 @@ class Cafe:
                 "SELECT * FROM transactions WHERE ts>=? AND ts<? ORDER BY ts", (start, end))]
             sessions = [dict(r) for r in self.db.execute(
                 "SELECT * FROM sessions WHERE started>=? AND started<? ORDER BY started", (start, end))]
+            orders = [dict(r) for r in self.db.execute(
+                "SELECT * FROM orders WHERE ts>=? AND ts<? AND status!='cancelled'", (start, end))]
+            top_items = [dict(r) for r in self.db.execute(
+                "SELECT oi.name, SUM(oi.qty) AS qty, ROUND(SUM(oi.qty*oi.price),2) AS sales,"
+                " ROUND(SUM(oi.qty*(oi.price-oi.cost)),2) AS margin FROM order_items oi JOIN orders o"
+                " ON o.id=oi.order_id WHERE o.ts>=? AND o.ts<? AND o.status!='cancelled'"
+                " GROUP BY oi.name ORDER BY qty DESC", (start, end))]
             top_games = [dict(r) for r in self.db.execute(
                 "SELECT game_name AS name, COUNT(*) AS launches, COUNT(DISTINCT pc_id) AS rigs"
                 " FROM game_launches WHERE ts>=? AND ts<? GROUP BY game_name ORDER BY launches DESC",
                 (start, end))]
-        cash_in = sum(t["amount"] for t in txns if t["kind"] in ("session_prepaid", "session_postpaid", "topup"))
+        cash_in = sum(t["amount"] for t in txns
+                      if t["kind"] in ("session_prepaid", "session_postpaid", "topup", "food", "food_refund"))
         refunds = sum(t["amount"] for t in txns if t["kind"] == "refund")
         usage = sum(t["amount"] for t in txns if t["kind"] == "member_usage")
         totals = {
@@ -1067,8 +1453,14 @@ class Cafe:
             "hours_played": round(sum((s["minutes"] or (now() - s["started"]) / 60) for s in sessions) / 60, 1),
             "package_sales": round(sum(s["prepaid"] or 0 for s in sessions if s["package"]), 2),
             "group_bookings": len({s["group_id"] for s in sessions if s["group_id"]}),
+            "food_sales": round(sum(o["total"] for o in orders), 2),
+            "food_cost": round(sum(o["cost"] for o in orders), 2),
+            "food_margin": round(sum(o["total"] - o["cost"] for o in orders), 2),
+            "food_orders": len(orders),
+            "food_unpaid": round(sum(o["total"] for o in orders if not o["paid"]), 2),
         }
-        return {"totals": totals, "transactions": txns, "sessions": sessions, "top_games": top_games}
+        return {"totals": totals, "transactions": txns, "sessions": sessions, "top_games": top_games,
+                "top_items": top_items}
 
     def report_csv(self, day):
         rep = self.report(day)
@@ -1087,6 +1479,11 @@ class Cafe:
         w.writerow(["Time", "Type", "PC", "Amount", "Method", "Note"])
         for t in rep["transactions"]:
             w.writerow([fmt(t["ts"]), t["kind"], t["pc_id"] or "", t["amount"], t["method"] or "", t["note"] or ""])
+        w.writerow([])
+        w.writerow(["Food & drinks sold"])
+        w.writerow(["Item", "Qty", "Sales", "Margin"])
+        for it in rep["top_items"]:
+            w.writerow([it["name"], it["qty"], it["sales"], it["margin"]])
         w.writerow([])
         w.writerow(["Games played"])
         w.writerow(["Game", "Launches", "Rigs"])
@@ -1215,6 +1612,14 @@ def make_handler(cafe):
                 if action == "processes":
                     cafe.put_processes(pc_id, body.get("list"))
                     return self._json({"ok": True})
+                if action == "menu":
+                    return self._json(cafe.pc_menu(pc_id))
+                if action == "order":
+                    o = cafe.place_order(body.get("items"), body.get("pay_method", "cash"), pc_id=pc_id,
+                                         source="pc", note=body.get("note", ""))
+                    if o["pay_method"] == "upi":
+                        o["upi"] = cafe.upi_details(o["total"], f"{o['pc_name']} order #{o['id']}")
+                    return self._json(o)
                 if action == "topup":
                     if body.get("cancel"):
                         cafe.cancel_topup(pc_id)
@@ -1263,6 +1668,52 @@ def make_handler(cafe):
                     if qs.get("refresh"):
                         cafe.command(pc_id, "processes")
                     return self._json(cafe.get_processes(pc_id))
+
+            # ---- F&B ----
+            if route == ["menu"]:
+                if method == "GET":
+                    return self._json(cafe.list_menu(include_inactive=bool(qs.get("all"))))
+                if method == "POST":
+                    return self._json({"ok": True, "id": cafe.save_menu(body)})
+            if route[:1] == ["menu"] and len(route) == 2 and method == "DELETE":
+                cafe.delete_menu(route[1])
+                return self._json({"ok": True})
+            if route == ["stock"]:
+                if method == "GET":
+                    return self._json(cafe.list_stock())
+                if method == "POST":
+                    return self._json({"ok": True, "id": cafe.save_stock(body)})
+            if route == ["stock", "moves"] and method == "GET":
+                return self._json(cafe.stock_moves(qs.get("stock_id", [None])[0]))
+            if route == ["stock.csv"] and method == "GET":
+                return self._send(200, "\ufeff" + cafe.stock_csv(), "text/csv; charset=utf-8",
+                                  {"Content-Disposition": 'attachment; filename="cafe-inventory.csv"'})
+            if route[:1] == ["stock"] and len(route) == 2 and method == "DELETE":
+                cafe.delete_stock(route[1])
+                return self._json({"ok": True})
+            if route[:1] == ["stock"] and len(route) == 3 and method == "POST":
+                if route[2] == "in":
+                    cafe.stock_in(route[1], body.get("qty"), body.get("cost_total"), body.get("note", ""))
+                    return self._json({"ok": True})
+                if route[2] == "adjust":
+                    cafe.adjust_stock(route[1], body.get("counted"), body.get("change"), body.get("reason", "adjust"))
+                    return self._json({"ok": True})
+            if route == ["orders"]:
+                if method == "GET":
+                    with cafe.lock:
+                        return self._json(cafe.list_orders(active=bool(qs.get("active")),
+                                                           day=qs.get("date", [None])[0]))
+                if method == "POST":   # counter POS
+                    return self._json(cafe.place_order(
+                        body.get("items"), body.get("pay_method", "cash"), pc_id=body.get("pc_id") or None,
+                        source="counter", customer=str(body.get("customer") or ""), note=body.get("note", ""),
+                        paid_now=bool(body.get("paid_now", True))))
+            if route[:1] == ["orders"] and len(route) == 3 and method == "POST":
+                if route[2] == "status":
+                    return self._json(cafe.set_order_status(route[1], body.get("status")))
+                if route[2] == "paid":
+                    cafe.mark_order_paid(route[1], body.get("method", "cash"))
+                    return self._json({"ok": True})
 
             if route == ["topups"] and method == "GET":
                 with cafe.lock:

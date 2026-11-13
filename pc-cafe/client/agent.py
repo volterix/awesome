@@ -291,6 +291,8 @@ class AgentApp:
         self.topup = {"kind": None, "upi": False, "options": [30, 60, 120], "last": None}
         self.rate = 0.0
         self.topup_win = None
+        self.food = {"enabled": False, "orders": []}
+        self.food_win, self.cart, self.menu = None, {}, None
 
         self.root = tk.Tk()
         self.root.title("CafeMaster")
@@ -415,6 +417,9 @@ class AgentApp:
         self.o_games = tk.Button(self.o_detail, text="Games", command=lambda: self.show_launcher(), bg="#1f2630",
                                  fg=TEXT, relief="flat", font=("Segoe UI", 9), cursor="hand2",
                                  activebackground="#2b3440")
+        self.o_order = tk.Label(self.o_detail, font=("Segoe UI", 9, "bold"), fg="#e3b341", bg=PANEL, justify="left")
+        self.o_food = tk.Button(self.o_detail, text="Food & drinks", command=self.open_food, bg="#d29922", fg="white",
+                                relief="flat", font=("Segoe UI", 9, "bold"), cursor="hand2", activebackground="#d29922")
         self.o_topup = tk.Button(self.o_detail, text="Top up", command=self.open_topup, bg="#2ea043", fg="white",
                                  relief="flat", font=("Segoe UI", 9, "bold"), cursor="hand2",
                                  activebackground="#2ea043")
@@ -462,6 +467,8 @@ class AgentApp:
         right.pack(side="right", padx=(0, 260))   # keep clear of the timer overlay (top-right)
         self.g_info = tk.Label(right, font=("Segoe UI", 12), fg=MUTED, bg=BG)
         self.g_info.pack(side="left", padx=(0, 16))
+        self.g_food = tk.Button(right, text="Food & drinks", command=self.open_food, bg="#d29922", fg="white",
+                                relief="flat", font=("Segoe UI", 10, "bold"), padx=12, pady=4, cursor="hand2")
         self.g_end = tk.Button(right, text="End session", command=self._logout, bg=PANEL, fg=TEXT, relief="flat",
                                font=("Segoe UI", 10), padx=12, pady=4, cursor="hand2")
         if self.cfg.get("allow_desktop"):
@@ -523,6 +530,158 @@ class AgentApp:
         self.g_note.config(text=f"Starting {game['name']}…")
         self.launcher.after(1500, self.launcher.withdraw)
         self.link.call_async("launch", {"game_id": game["id"]}, "launched")
+
+    # ---- food & drinks -------------------------------------------------------
+    PAY_TEXT = {"tab": "Add to my bill", "balance": "Pay from my balance", "upi": "UPI (scan QR)",
+                "cash": "Cash on delivery"}
+
+    def open_food(self):
+        if self.state != "active":
+            return
+        if self.food_win and self.food_win.winfo_exists():
+            self.food_win.deiconify()
+            self.food_win.lift()
+            return
+        w = self.food_win = tk.Toplevel(self.root, bg=PANEL)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        self.cart, self.menu, self._cat = {}, None, None
+        self._food_frame = tk.Frame(w, bg=PANEL, padx=24, pady=20, highlightthickness=2, highlightbackground="#d29922")
+        self._food_frame.pack()
+        self._food_clear("Loading menu…")
+        self._food_place()
+        self.link.call_async("menu", {}, "menu")
+        self.root.after(200, lambda: mon.force_foreground(self._hwnd(w)))
+
+    def _food_place(self):
+        w = self.food_win
+        w.update_idletasks()
+        w.geometry(f"+{(w.winfo_screenwidth() - w.winfo_reqwidth()) // 2}"
+                   f"+{max(20, (w.winfo_screenheight() - w.winfo_reqheight()) // 2)}")
+
+    def _food_clear(self, title):
+        for c in self._food_frame.winfo_children():
+            c.destroy()
+        head = tk.Frame(self._food_frame, bg=PANEL)
+        head.pack(fill="x")
+        tk.Label(head, text=title, font=("Segoe UI", 18, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+        tk.Button(head, text="Close", command=self._food_close, bg="#1f2630", fg=TEXT, relief="flat",
+                  font=("Segoe UI", 10), padx=12, cursor="hand2").pack(side="right", padx=(24, 0))
+
+    def _food_close(self):
+        if self.food_win and self.food_win.winfo_exists():
+            self.food_win.destroy()
+        self.food_win = None
+
+    def _on_menu(self, m):
+        if not (self.food_win and self.food_win.winfo_exists()):
+            return
+        self.menu = m
+        cats = list(dict.fromkeys(i["category"] for i in m["items"]))
+        self._cat = self._cat if self._cat in cats else (cats[0] if cats else None)
+        msg, self._food_msg = getattr(self, "_food_msg", None), None
+        self._food_draw(msg)
+
+    def _on_menu_error(self, err):
+        if self.food_win and self.food_win.winfo_exists():
+            self._food_clear("Menu unavailable")
+            tk.Label(self._food_frame, text=err, fg=RED, bg=PANEL, font=("Segoe UI", 11)).pack(anchor="w", pady=8)
+
+    def _food_draw(self, msg=None):
+        m, cur = self.menu, self.menu["currency"]
+        self._food_clear("Food & drinks")
+        body = tk.Frame(self._food_frame, bg=PANEL)
+        body.pack(fill="both", pady=(12, 0))
+        cats = tk.Frame(body, bg=PANEL)
+        cats.grid(row=0, column=0, sticky="n", padx=(0, 14))
+        for c in dict.fromkeys(i["category"] for i in m["items"]):
+            on = c == self._cat
+            tk.Button(cats, text=c, width=12, anchor="w",
+                      command=lambda c=c: (setattr(self, "_cat", c), self._food_draw()),
+                      bg=ACCENT if on else "#1f2630", fg="white" if on else TEXT, relief="flat",
+                      font=("Segoe UI", 11, "bold" if on else "normal"), pady=6, cursor="hand2").pack(fill="x", pady=2)
+        grid = tk.Frame(body, bg=PANEL)
+        grid.grid(row=0, column=1, sticky="n")
+        for i, it in enumerate([x for x in m["items"] if x["category"] == self._cat]):
+            ok = it["available"]
+            tk.Button(grid, text=f"{it['name']}\n{cur}{it['price']:g}" + ("" if ok else "\nSold out"),
+                      command=lambda it=it: self._cart_add(it, 1), state="normal" if ok else "disabled",
+                      bg="#1f2630", fg=TEXT, disabledforeground=MUTED, activebackground="#2b3440", relief="flat",
+                      font=("Segoe UI", 11, "bold"), width=15, height=3, wraplength=150,
+                      cursor="hand2").grid(row=i // 3, column=i % 3, padx=4, pady=4)
+        cart = tk.Frame(body, bg="#1f2630", padx=14, pady=12)
+        cart.grid(row=0, column=2, sticky="n", padx=(14, 0))
+        tk.Label(cart, text="Your order", font=("Segoe UI", 12, "bold"), fg=TEXT, bg="#1f2630").pack(anchor="w")
+        items = {i["id"]: i for i in m["items"]}
+        total = 0
+        for mid, q in self.cart.items():
+            it = items.get(mid)
+            if not it or q <= 0:
+                continue
+            total += it["price"] * q
+            row = tk.Frame(cart, bg="#1f2630")
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=it["name"][:18], width=18, anchor="w", fg=TEXT, bg="#1f2630",
+                     font=("Segoe UI", 10)).pack(side="left")
+            tk.Button(row, text="−", command=lambda it=it: self._cart_add(it, -1), bg=PANEL, fg=TEXT,
+                      relief="flat", width=2, cursor="hand2").pack(side="left", padx=1)
+            tk.Label(row, text=str(q), width=2, fg=TEXT, bg="#1f2630").pack(side="left")
+            tk.Button(row, text="+", command=lambda it=it: self._cart_add(it, 1), bg=PANEL, fg=TEXT,
+                      relief="flat", width=2, cursor="hand2").pack(side="left", padx=1)
+        if not total:
+            tk.Label(cart, text="Tap an item to add it", fg=MUTED, bg="#1f2630",
+                     font=("Segoe UI", 10)).pack(anchor="w", pady=6)
+        tk.Label(cart, text=f"Total  {cur}{total:g}", font=("Segoe UI", 14, "bold"), fg=TEXT,
+                 bg="#1f2630").pack(anchor="w", pady=(10, 6))
+        if msg:
+            tk.Label(cart, text=msg, fg=RED, bg="#1f2630", wraplength=220, font=("Segoe UI", 10)).pack(anchor="w")
+        if total:
+            tk.Label(cart, text="Pay by", fg=MUTED, bg="#1f2630", font=("Segoe UI", 9)).pack(anchor="w")
+            for meth in m["methods"]:
+                tk.Button(cart, text=self.PAY_TEXT.get(meth, meth), command=lambda meth=meth: self._food_order(meth),
+                          bg="#2ea043" if meth in ("tab", "balance") else ACCENT, fg="white", relief="flat",
+                          font=("Segoe UI", 10, "bold"), pady=4, cursor="hand2").pack(fill="x", pady=2)
+        self._food_place()
+
+    def _cart_add(self, it, d):
+        self.cart[it["id"]] = max(0, self.cart.get(it["id"], 0) + d)
+        if it.get("can_make") is not None and self.cart[it["id"]] > it["can_make"]:
+            self.cart[it["id"]] = it["can_make"]
+            return self._food_draw(f"Only {it['can_make']} × {it['name']} left")
+        self._food_draw()
+
+    def _food_order(self, method):
+        items = [{"menu_id": k, "qty": q} for k, q in self.cart.items() if q > 0]
+        self._food_clear("Placing order…")
+        self.link.call_async("order", {"items": items, "pay_method": method}, "order")
+
+    def _on_order(self, o):
+        if not (self.food_win and self.food_win.winfo_exists()):
+            return
+        cur = self.menu["currency"] if self.menu else self.currency
+        self.cart = {}
+        if o["pay_method"] == "upi" and o.get("upi"):
+            u = o["upi"]
+            self._food_clear(f"Order #{o['id']}: scan to pay {cur}{o['total']:g}")
+            self._draw_qr(self._food_frame, qr.make(qr.upi_link(u["upi_id"], u["payee"], u["amount"], u["note"])))
+            tk.Label(self._food_frame, text=f"Pay with any UPI app to {u['upi_id']}.\nWe'll bring your order to "
+                                            f"{self.cfg['name']} once staff confirm.", fg=MUTED, bg=PANEL,
+                     font=("Segoe UI", 10), justify="center").pack(pady=(8, 0))
+        else:
+            how = {"tab": f"{cur}{o['total']:g} added to your bill. Pay when you finish.",
+                   "balance": f"{cur}{o['total']:g} paid from your balance.",
+                   "cash": f"Please pay {cur}{o['total']:g} in cash when it arrives."}.get(o["pay_method"], "")
+            self._food_clear(f"Order #{o['id']} placed!")
+            tk.Label(self._food_frame, text=f"We'll bring it to {self.cfg['name']}.\n{how}", fg=TEXT, bg=PANEL,
+                     font=("Segoe UI", 12), justify="left").pack(anchor="w", pady=(10, 0))
+            self.root.after(5000, self._food_close)
+        self._food_place()
+
+    def _on_order_error(self, err):
+        if self.food_win and self.food_win.winfo_exists() and self.menu:
+            self._food_msg = err
+            self.link.call_async("menu", {}, "menu")          # refresh stock levels, then show the error
+            self._food_draw(err)
 
     # ---- top-up with UPI QR ---------------------------------------------------
     def open_topup(self):
@@ -766,6 +925,7 @@ class AgentApp:
         self.l_conn.config(text=f"Connected to {self.cfg['server']}", fg=MUTED)
         self.games = d.get("games") or []
         self.timeup = d.get("timeup") or self.timeup
+        self.food = d.get("food") or self.food
         self.topup = d.get("topup") or self.topup
         self.rate = (d.get("session") or {}).get("rate") or d.get("rate") or 0
         self._topup_status()
@@ -843,6 +1003,8 @@ class AgentApp:
                 if w.winfo_exists():
                     w.destroy()
             self._toasts = []
+            if self.food_win and self.food_win.winfo_exists():
+                self.food_win.destroy()
             if was_active:
                 # a full-screen game can sit above our window: close (or minimise) it first
                 app = mon.clear_foreground_app(close=self.timeup.get("close_game", True),
@@ -918,6 +1080,19 @@ class AgentApp:
             else:
                 self.o_end.pack_forget()
                 self.g_end.pack_forget()
+            if self.food.get("enabled"):
+                self.o_food.pack(anchor="w", pady=(6, 0))
+                self.g_food.pack(side="right", padx=(8, 0))
+            else:
+                self.o_food.pack_forget()
+                self.g_food.pack_forget()
+            labels = {"new": "received", "preparing": "being prepared", "delivered": "delivered"}
+            live = [o for o in self.food.get("orders", []) if o["status"] in ("new", "preparing")]
+            if live:
+                self.o_order.config(text="\n".join(f"Order #{o['id']} {labels[o['status']]}" for o in live[:2]))
+                self.o_order.pack(anchor="w", pady=(4, 0))
+            else:
+                self.o_order.pack_forget()
             if self.topup.get("kind"):
                 self.o_topup.pack(anchor="w", pady=(6, 0))
             else:

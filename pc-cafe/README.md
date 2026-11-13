@@ -34,6 +34,11 @@ One master PC controls every gaming PC in the cafe. Staff use a browser dashboar
 | **Remote screen view** | The **Monitor** tab shows live thumbnails of every PC in use. Click one to watch it full size (refreshes about once a second) and see the window or browser tab that's open. From the same screen you can **Lock now**, **Close current app**, **Send warning**, see **Running programs** (and close any of them), restart or shut down the PC. |
 | **Cafe rules** | Set in **Settings › Monitoring & cafe rules**. **Blocked programs** (torrent clients by default) are closed automatically. **Blocked words** in a window or tab title raise an alert. **Blocked websites** become unreachable on every PC. Choose whether a broken rule only alerts staff or locks the PC straight away. |
 | **Alerts log** | Every broken rule is logged with the time, PC, customer and a screenshot of the screen at that moment, for evidence if needed. Screenshots are kept for 7 days. Unreviewed alerts show as a red badge. |
+| **Food & drinks: ordering** | Customers tap **Food & drinks** on their PC (on the timer or in the game launcher), browse categories, add to a cart and choose how to pay:<br>• **Add to my bill**: collected at End & bill.<br>• **Pay from my balance**: members only.<br>• **UPI**: shows a QR code.<br>• **Cash on delivery**.<br>Sold-out items are greyed out. The timer shows the order's progress ("Order #12 being prepared"). Staff can also take walk-in orders on the **Counter order** POS. |
+| **Kitchen board** | **F&B › Orders** has three columns: New, Preparing, and Delivered-but-unpaid. Staff tap **Accept**, then **Delivered**, then **Paid cash** or **Paid UPI**. New orders chime. **Cancel** puts the stock back and refunds a balance payment. |
+| **Menu with recipes** | Packaged items (Coke, chips) track their own stock one-for-one. Made items list the stock they use: Masala Maggi uses 1 Maggi packet, Cutting Chai uses 60 ml milk, 3 g tea and 8 g sugar. Each item shows its cost, margin % and how many can still be made. |
+| **Inventory** | **Stock in** records a purchase and updates the average cost. **Count / waste** corrects stock after a physical count or records wastage. Every change goes into a log. Items flagged **Low** need reordering. Shows total stock value and exports to CSV for Excel or Sheets. |
+| **F&B in billing and reports** | Food added to a PC bill is included in **End & bill**. Reports show food sales, cost of goods, margin, items sold and unpaid orders, and the CSV export includes them. |
 | **Resilience** | Running sessions survive a server restart because they are stored in SQLite. Commands are sent to each PC once. |
 
 The only requirement is **Python 3.9 or later**. There is nothing to `pip install`.
@@ -72,7 +77,22 @@ Then test it: start a 15-minute session on one PC, tap **Top up**, scan the QR w
 
 **Why staff approve each payment:** a plain UPI QR can't tell the software that money arrived. That needs a payment gateway (Razorpay, Cashfree, PhonePe PG), which brings merchant KYC and about 2% fees. Approving takes one click after you glance at your UPI app or soundbox. Unanswered requests expire after 15 minutes. A gateway can be added later.
 
-### 4. Games and rigs (one-time)
+### 4. Food & drinks (one-time, about 20 minutes)
+1. Go to **F&B › Inventory › + Stock item** for everything you buy. For each one, set:
+   - the unit (pcs, g, ml)
+   - the cost per unit
+   - the quantity you have now
+   - the level at which you should reorder
+
+   Packaged items (Coke, chips, water) can skip this step, because the next step creates their stock automatically.
+2. Go to **F&B › Menu › + Menu item**:
+   - **Packaged:** enter the selling price, the buying cost and the quantity in stock.
+   - **Made from ingredients:** add each ingredient and the amount one serving uses.
+3. From then on, record deliveries with **Stock in**, and do a weekly **Count** so the system matches the shelf.
+
+Menu prices are the final price the customer pays, including GST. If you're GST-registered, check the right rate with your CA. Restaurant service is usually 5%, and packaged goods are sold at MRP. You'll also need a GST invoice format; this version doesn't print tax invoices.
+
+### 5. Games and rigs (one-time)
 1. **Games tab, then + Add game.** Enter the name and the **launch target**:
    - **Steam games:** in Steam, right-click the game, choose **Manage**, then **Add desktop shortcut**. Open the shortcut's **Properties** and copy the `steam://rungameid/…` link.
    - **EA app and other games:** use the `.exe` or shortcut path. It must be the same path on every rig.
