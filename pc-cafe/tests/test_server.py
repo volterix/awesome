@@ -368,5 +368,114 @@ class CafeTest(unittest.TestCase):
         self.call("/api/alerts/ack", {})
         self.assertEqual(self.call("/api/state")["alerts_open"], 0)
 
+    # ---- v4: time-up warnings, top-ups with UPI QR --------------------------------
+    def test_timeup_settings_delivered(self):
+        r = self.call("/api/settings", {"timeup": {"warn_minutes": "10, 5 1", "close_game": False}})
+        self.assertEqual(r["timeup"], {"warn_minutes": [10, 5, 1], "close_game": False})
+        hb = self.agent("TU-1")
+        self.assertEqual(hb["timeup"]["warn_minutes"], [10, 5, 1])
+        self.assertFalse(hb["timeup"]["close_game"])
+        self.call("/api/settings", {"timeup": {"close_game": True}})
+
+    def test_payment_settings_validation(self):
+        self.assertEqual(self.call("/api/settings", {"payments": {"upi_id": "not a upi"}})["_status"], 400)
+        self.assertEqual(self.call("/api/settings", {"payments": {"topup_options": "0 -5"}})["_status"], 400)
+        r = self.call("/api/settings", {"payments": {"upi_id": "mycafe@okhdfcbank", "payee_name": "My Cafe",
+                                                     "topup_options": "120 30, 60"}})
+        self.assertEqual(r["payments"]["topup_options"], [30, 60, 120])
+
+    def test_prepaid_topup_upi_approve(self):
+        self.call("/api/settings", {"payments": {"upi_id": "mycafe@okhdfcbank", "payee_name": "My Cafe"}})
+        self.agent("TU-2")
+        self.assertIsNone(self.agent("TU-2")["topup"]["kind"])              # nothing running: no top-up
+        self.call("/api/pc/TU-2/start", {"mode": "prepaid", "minutes": 30, "label": "Vikram"})
+        hb = self.agent("TU-2")
+        self.assertEqual(hb["topup"]["kind"], "time")
+        self.assertTrue(hb["topup"]["upi"])
+        req = self.agent("TU-2", "topup", minutes=60, method="upi")
+        self.assertEqual((req["amount"], req["upi_id"], req["ref"]), (60.0, "mycafe@okhdfcbank", f"T{req['id']}"))
+        self.assertIn("+60 min", req["note"])
+        pend = self.call("/api/state")["topups_pending"]
+        self.assertEqual([(t["id"], t["user_label"]) for t in pend if t["pc_id"] == "TU-2"], [(req["id"], "Vikram")])
+        self.call(f"/api/topups/{req['id']}/approve", {})
+        hb = self.agent("TU-2")
+        self.assertAlmostEqual(hb["session"]["remaining"], 90 * 60, delta=3)
+        self.assertEqual(hb["session"]["cost"], 90)
+        self.assertEqual(hb["topup"]["last"]["status"], "approved")
+        self.assertTrue(any("Payment received" in c.get("text", "") for c in hb["commands"]))
+        self.assertEqual(self.call(f"/api/topups/{req['id']}/approve", {})["_status"], 409)   # no double credit
+        upi = [t for t in self.call("/api/report")["transactions"] if t["pc_id"] == "TU-2" and t["method"] == "upi"]
+        self.assertEqual(upi[0]["amount"], 60)
+        self.call("/api/pc/TU-2/end", {})
+
+    def test_topup_after_time_up_unlocks_pc(self):
+        self.agent("TU-3")
+        self.call("/api/pc/TU-3/start", {"mode": "prepaid", "minutes": 30, "label": "Neha"})
+        with self.cafe.lock:
+            self.cafe.db.execute("UPDATE sessions SET ends=? WHERE pc_id='TU-3' AND ended IS NULL", (time.time() - 1,))
+        self.cafe.tick()
+        hb = self.agent("TU-3")
+        self.assertEqual((hb["state"], hb["topup"]["kind"]), ("locked", "extend"))
+        req = self.agent("TU-3", "topup", minutes=30, method="counter")
+        self.assertEqual(req["kind"], "extend")
+        self.call(f"/api/topups/{req['id']}/approve", {})
+        hb = self.agent("TU-3")
+        self.assertEqual(hb["state"], "active")
+        self.assertEqual(hb["session"]["user"], "Neha")
+        self.assertAlmostEqual(hb["session"]["remaining"], 1800, delta=3)
+        self.call("/api/pc/TU-3/end", {})
+        # the extend window closes: a walk-in can't unlock a PC long after their time ended
+        with self.cafe.lock:
+            self.cafe.db.execute("UPDATE sessions SET ended=?, end_reason='time_up' WHERE pc_id='TU-3'",
+                                 (time.time() - 3600,))
+        self.assertIsNone(self.agent("TU-3")["topup"]["kind"])
+        self.assertEqual(self.agent("TU-3", "topup", minutes=30, method="counter")["_status"], 409)
+
+    def test_member_topup_reject_cancel_expire(self):
+        self.agent("TU-4")
+        mid = self.call("/api/members", {"username": "aditi", "password": "pass1", "balance": 60})["id"]
+        self.agent("TU-4", "login", username="aditi", password="pass1")
+        self.assertEqual(self.agent("TU-4")["topup"]["kind"], "balance")
+        r1 = self.agent("TU-4", "topup", minutes=60, method="counter")
+        r2 = self.agent("TU-4", "topup", minutes=120, method="counter")      # replaces the first
+        statuses = {t["id"]: t["status"] for t in self.call("/api/topups")}
+        self.assertEqual((statuses[r1["id"]], statuses[r2["id"]]), ("cancelled", "pending"))
+        self.call(f"/api/topups/{r2['id']}/reject", {})
+        self.assertEqual(self.agent("TU-4")["topup"]["last"]["status"], "rejected")
+        r3 = self.agent("TU-4", "topup", minutes=60, method="counter")
+        self.call(f"/api/topups/{r3['id']}/approve", {})
+        m = next(x for x in self.call("/api/members") if x["id"] == mid)
+        self.assertEqual(m["balance"], 120)
+        r4 = self.agent("TU-4", "topup", minutes=30, method="counter")
+        self.agent("TU-4", "topup", cancel=True)
+        self.assertEqual(next(t for t in self.call("/api/topups") if t["id"] == r4["id"])["status"], "cancelled")
+        r5 = self.agent("TU-4", "topup", minutes=30, method="counter")
+        with self.cafe.lock:
+            self.cafe.db.execute("UPDATE topups SET ts=? WHERE id=?", (time.time() - 3600, r5["id"]))
+        self.cafe.tick()
+        self.assertEqual(next(t for t in self.call("/api/topups") if t["id"] == r5["id"])["status"], "expired")
+        self.agent("TU-4", "logout")
+
+    def test_upi_needs_setup_and_postpaid_has_no_topup(self):
+        self.call("/api/settings", {"payments": {"upi_id": ""}})
+        self.agent("TU-5")
+        self.call("/api/pc/TU-5/start", {"mode": "prepaid", "minutes": 30})
+        self.assertEqual(self.agent("TU-5", "topup", minutes=30, method="upi")["_status"], 400)
+        self.call("/api/pc/TU-5/end", {})
+        self.call("/api/pc/TU-5/start", {"mode": "postpaid"})
+        self.assertIsNone(self.agent("TU-5")["topup"]["kind"])
+        self.call("/api/pc/TU-5/end", {})
+
+    def test_database_never_left_locked(self):
+        import sqlite3
+        self.agent("DB-1")
+        self.call("/api/pc/DB-1/update", {"name": "New name", "group": "NoSuchGroup"})   # fails half-way
+        self.cafe.tick()
+        other = sqlite3.connect(os.path.join(self.tmp, "cafe.db"), timeout=0.5)
+        other.execute("UPDATE pcs SET notes='x' WHERE id='DB-1'")    # another program can write
+        other.commit()
+        other.close()
+        self.assertNotEqual(next(p for p in self.call("/api/state")["pcs"] if p["id"] == "DB-1")["name"], "New name")
+
 if __name__ == "__main__":
     unittest.main()

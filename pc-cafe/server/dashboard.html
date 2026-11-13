@@ -85,6 +85,11 @@ input[type=text],input[type=password],input[type=number],input[type=date],select
 .vbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0}
 .procs{max-height:260px;overflow:auto;margin-top:8px}
 textarea{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 9px;font:inherit;color:inherit;min-height:90px;resize:vertical}
+.paybar{background:rgba(46,160,67,.1);border:1px solid rgba(46,160,67,.5);border-radius:10px;padding:10px 12px;margin-bottom:14px}
+.paybar h4{margin:0 0 8px;font-size:13px;color:#56d364}
+.payrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:6px 0;border-top:1px solid rgba(46,160,67,.25)}
+.payrow:first-of-type{border-top:0}
+.payrow .amt{font-size:18px;font-weight:650;min-width:80px}
 .empty{padding:40px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:10px}
 code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break-all}
 @media (max-width:640px){header{padding:10px 16px}main{padding:14px 16px}.kpis{margin-left:0;width:100%}}
@@ -136,6 +141,7 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
       <button class="btn danger" data-bulk="restart">Restart</button>
       <button class="btn danger" data-bulk="shutdown">Shut down</button>
     </div>
+    <div id="paybar" class="paybar hide"></div>
     <div id="grid" class="grid"></div>
   </section>
 
@@ -218,6 +224,16 @@ code{background:var(--panel2);padding:2px 6px;border-radius:4px;word-break:break
       <div class="row"><label>New admin password (leave blank to keep)</label><input type="password" id="sPw"></div>
       <div class="row"><label>Agent key (paste into each gaming PC's agent config)</label><code id="sKey"></code></div>
       <div class="foot"><button class="btn pri" id="sSave">Save settings</button></div>
+    </div>
+    <div class="card" style="max-width:560px;margin-top:16px">
+      <h3 style="margin-top:0">Time-up warnings &amp; payments</h3>
+      <div class="row"><label>Warn customers this many minutes before time runs out (e.g. 10 5 1)</label><input type="text" id="tWarn"></div>
+      <div class="row"><label class="chip" style="align-self:flex-start"><input type="checkbox" id="tClose"> Close the game in front when time is up (so the lock screen always shows)</label></div>
+      <div class="row"><label>UPI ID for the payment QR shown on PCs (leave blank for counter payment only)</label><input type="text" id="payUpi" placeholder="yourcafe@okhdfcbank"></div>
+      <div class="row"><label>Name shown in the customer's UPI app</label><input type="text" id="payName"></div>
+      <div class="row"><label>Top-up options on the PC, in minutes (e.g. 30 60 120)</label><input type="text" id="payOpts"></div>
+      <div class="sub">Customers tap <strong>Top up</strong> on their PC, scan the QR and pay. The payment appears at the top of the PCs tab; check your UPI app or soundbox, then press <strong>Approve</strong> and the time is added on the spot.</div>
+      <div class="foot"><button class="btn pri" id="tSave">Save</button></div>
     </div>
     <div class="card" style="max-width:560px;margin-top:16px">
       <h3 style="margin-top:0">Monitoring &amp; cafe rules</h3>
@@ -305,6 +321,7 @@ function render(){
   $('#navAlerts').textContent = state.alerts_open; $('#navAlerts').classList.toggle('hide', !state.alerts_open);
   if (!$('#tab-monitor').classList.contains('hide')) renderScreens();
   if (viewerId) updateViewerInfo();
+  renderPayments();
   for (const id of [...selected]) if (!pcs.find(p=>p.id===id)) selected.delete(id);
   $('#selCount').textContent = selected.size ? `${selected.size} selected` : '';
   $('#selAll').checked = pcs.length && selected.size === pcs.length;
@@ -664,6 +681,9 @@ $('#sAddRate').onclick = () => rateRow();
 async function loadSettings(){
   try { const s = await api('/settings');
     $('#sName').value=s.cafe_name; $('#sCur').value=s.currency; $('#sMin').value=s.min_minutes; $('#sRound').value=s.round_to_minutes;
+    const tu = s.timeup || {}, pay = s.payments || {};
+    $('#tWarn').value = (tu.warn_minutes||[]).join(' '); $('#tClose').checked = tu.close_game !== false;
+    $('#payUpi').value = pay.upi_id||''; $('#payName').value = pay.payee_name||''; $('#payOpts').value = (pay.topup_options||[]).join(' ');
     const m = s.monitoring || {}; $('#mScreen').checked = m.screen_view !== false;
     $('#mApps').value=(m.blocked_apps||[]).join('\n'); $('#mWords').value=(m.blocked_keywords||[]).join('\n');
     $('#mSites').value=(m.blocked_sites||[]).join('\n'); $('#mAction').value=m.on_violation||'alert';
@@ -675,9 +695,36 @@ $('#sSave').onclick = () => { const rates={}; $$('#sRates .bar').forEach(r=>{ co
   if ($('#sPw').value) body.admin_password=$('#sPw').value;
   act(()=>api('/settings',{body}), 'Settings saved').then(loadSettings) };
 
+$('#tSave').onclick = () => act(()=>api('/settings',{body:{timeup:{warn_minutes:$('#tWarn').value, close_game:$('#tClose').checked},
+  payments:{upi_id:$('#payUpi').value, payee_name:$('#payName').value, topup_options:$('#payOpts').value}}}), 'Saved — PCs pick it up within a few seconds').then(loadSettings);
 $('#mSave').onclick = () => act(()=>api('/settings',{body:{monitoring:{screen_view:$('#mScreen').checked,
   blocked_apps:$('#mApps').value, blocked_keywords:$('#mWords').value, blocked_sites:$('#mSites').value,
   on_violation:$('#mAction').value}}}), 'Rules saved — PCs pick them up within a few seconds').then(loadSettings);
+
+// ---------- payments from PCs ----------
+let seenTopups = new Set(), firstPayRender = true;
+function chime(){ try { const c = new (window.AudioContext||window.webkitAudioContext)(), o = c.createOscillator(), g = c.createGain();
+  o.connect(g); g.connect(c.destination); o.frequency.value = 880; g.gain.value = .15; o.start();
+  o.frequency.setValueAtTime(1175, c.currentTime + .15); o.stop(c.currentTime + .35) } catch {} }
+function renderPayments(){
+  const list = state.topups_pending || [];
+  const fresh = list.filter(t => !seenTopups.has(t.id));
+  if (fresh.length && !firstPayRender){ chime(); toast(`New payment: ${fresh[0].pc_name} ${money(fresh[0].amount)}`) }
+  firstPayRender = false; list.forEach(t => seenTopups.add(t.id));
+  const box = $('#paybar'); box.classList.toggle('hide', !list.length);
+  if (!list.length) return;
+  const nowS = Date.now()/1000 + clockOffset;
+  const what = {time:'more time', extend:'unlock after time-up', balance:'member balance'};
+  box.innerHTML = `<h4>Payments waiting for you (${list.length}) — check your UPI app / cash, then approve</h4>` + list.map(t => `
+    <div class="payrow"><span class="amt">${money(t.amount)}</span>
+      <span><b>${esc(t.pc_name)}</b> · ${esc(t.user_label)} · +${t.minutes} min (${what[t.kind]||t.kind})<br>
+      <span class="muted">${t.method==='upi'?'UPI · ref T'+t.id:'Pay at counter · ref T'+t.id} · ${Math.max(0,Math.round((nowS-t.ts)/60))} min ago</span></span>
+      <span class="sp" style="flex:1"></span>
+      <button class="btn ok" onclick="approvePay(${t.id})">Approve</button>
+      <button class="btn danger" onclick="rejectPay(${t.id})">Reject</button></div>`).join('');
+}
+async function approvePay(id){ await act(()=>api(`/topups/${id}/approve`, {body:{}}), 'Approved — time added') }
+async function rejectPay(id){ if (confirm('Reject this payment? The customer is told to see staff.')) await act(()=>api(`/topups/${id}/reject`, {body:{}}), 'Rejected') }
 
 // ---------- monitor: live screens ----------
 const thumbs = {};          // pc_id -> object URL of latest thumbnail

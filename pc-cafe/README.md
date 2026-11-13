@@ -24,7 +24,10 @@ One master PC controls every gaming PC in the cafe. Staff use a browser dashboar
 | **Billing** | Rates per hour for each PC group (for example Standard ₹60, VIP ₹100). Adds a minimum billable time and optional rounding to blocks of minutes. Shows a bill on screen when a session ends, and records cash, UPI or card. |
 | **Members** | Accounts with a prepaid balance. Staff can top up, refund and reset passwords. A top-up during a session extends the time straight away. A member can't be logged in on two PCs at once. |
 | **Reports** | Daily cash collected, walk-in sales, member top-ups and usage, sessions and hours played. Downloads as a CSV that opens directly in Excel or Google Sheets. |
-| **Client lock screen** | Full-screen and always on top. Includes member login, a small timer overlay that can be dragged around during play, and warnings at 5 minutes and 1 minute. The PC locks itself when time is up, even if the network drops. |
+| **Client lock screen** | Full-screen and always on top. Includes member login and a small timer overlay that can be dragged around during play. |
+| **Auto-lock when time is up** | The PC locks itself the moment paid time runs out, **even mid-game**. It closes the game in front (or just minimises it, if you prefer) and pulls the lock screen to the front. It works even if the network drops. |
+| **Time warnings** | Pop-ups at **10, 5 and 1 minute** left (you can change these). They appear on top of the game without taking the keyboard away, beep, include a **Top up now** button and close themselves. They re-arm after a top-up. |
+| **Top-up with UPI QR** | The customer taps **Top up** (on the timer, in a warning, or on the lock screen after time is up), picks +30 min, +1 hr or +2 hr, and gets a **UPI QR code** for that exact amount, which works with GPay, PhonePe, Paytm and BHIM. Staff see the payment at the top of the dashboard with a chime, check their UPI app or soundbox, and press **Approve**. The time is added instantly, or the PC unlocks if it had already locked. "Pay at counter" works the same way for cash. |
 | **Game launcher** | When a session starts, the rig shows full-screen tiles for the games installed on it. The customer clicks a tile to play. Staff can also launch a game remotely on one rig or many from the dashboard. |
 | **Rig register** | Records which Steam or EA account is signed in on each rig, which games are installed and hardware notes. Flags rigs that share one account, because those rigs can't play online at the same time. Never stores passwords. |
 | **Packages and group start** | Fixed-price bundles such as "5 hours for ₹250" (charged per rig) or "Race night: 4 rigs × 1 hour for ₹800" (one price, split across the rigs). Tick several rigs and click **Start group** to start them all together, charge once and auto-launch the same game on every rig. **End group** closes them together. |
@@ -58,7 +61,18 @@ The only requirement is **Python 3.9 or later**. There is nothing to `pip instal
 
 **Testing without shutting PCs down:** run `python agent.py --dry-run`. Shutdown, restart and log off are then printed instead of carried out.
 
-### 3. Games and rigs (one-time)
+### 3. Payments and warnings (one-time)
+Go to **Settings › Time-up warnings & payments** and fill in:
+- Your **UPI ID**, for example `yourcafe@okhdfcbank`.
+- The name customers see in their UPI app.
+- The top-up options.
+- The warning minutes.
+
+Then test it: start a 15-minute session on one PC, tap **Top up**, scan the QR with your own phone (don't pay) and check that the cafe name and amount are correct.
+
+**Why staff approve each payment:** a plain UPI QR can't tell the software that money arrived. That needs a payment gateway (Razorpay, Cashfree, PhonePe PG), which brings merchant KYC and about 2% fees. Approving takes one click after you glance at your UPI app or soundbox. Unanswered requests expire after 15 minutes. A gateway can be added later.
+
+### 4. Games and rigs (one-time)
 1. **Games tab, then + Add game.** Enter the name and the **launch target**:
    - **Steam games:** in Steam, right-click the game, choose **Manage**, then **Add desktop shortcut**. Open the shortcut's **Properties** and copy the `steam://rungameid/…` link.
    - **EA app and other games:** use the `.exe` or shortcut path. It must be the same path on every rig.
@@ -104,6 +118,7 @@ The only requirement is **Python 3.9 or later**. There is nothing to `pip instal
 
 ## Limits of this version
 
+- **Some games can block the time-up lock.** A game in exclusive full-screen mode can occasionally hold the screen. That's why "Close the game in front when time is up" is on by default. If you turn it off, the game is only minimised, so set games to borderless-window mode.
 - **The lock screen is not tamper-proof.** It is a full-screen window that stays on top. A determined user can still get past it with `Ctrl+Alt+Del` and Task Manager. For production, lock down each gaming PC's Windows account:
   - Use a **standard (non-admin) user**.
   - Use Group Policy to remove Task Manager (`gpedit.msc`, then User Config, then Admin Templates, then System, then Ctrl+Alt+Del Options).
@@ -133,6 +148,8 @@ server/dashboard.html  Staff UI (vanilla JS, polls /api/state every 2 s)
 client/agent.py        Gaming-PC agent (tkinter UI + background heartbeat thread)
 tests/test_server.py   End-to-end tests: python3 -m unittest discover -s tests
 ```
+
+**Payments:** `client/qr.py` is a small built-in QR generator, so nothing needs to be installed on the PCs. It was checked module-for-module against the `qrcode` package and decoded with OpenCV, including straight from a screenshot of the PC.
 
 **Monitoring files:** `client/monitor.py` holds the screen capture (Windows GDI via ctypes, nothing to install), window title, process list, closing programs, rule checks and hosts-file blocking. A PC streams its screen only while someone is watching it on the dashboard.
 

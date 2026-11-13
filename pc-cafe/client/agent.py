@@ -31,12 +31,13 @@ import base64
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import monitor as mon  # noqa: E402  (sits next to this file)
+import qr  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
 CONFIG_PATH = os.path.join(HERE, "agent_config.json")
 HEARTBEAT_EVERY = 2.0
 OFFLINE_GRACE = 15          # seconds without server before we show "no connection"
-WARN_AT = (300, 60)         # warn user at 5 min and 1 min left
+DEFAULT_WARN_MINUTES = (10, 5, 1)   # overridden by Settings › Time-up on the server
 
 BG, PANEL, TEXT, MUTED, ACCENT, RED = "#0d1117", "#161b22", "#e6edf3", "#8b98a8", "#4f8cff", "#e5534b"
 
@@ -286,6 +287,10 @@ class AgentApp:
         self.warned = set()
         self.cafe_name, self.currency = "CafeMaster", "₹"
         self.games, self._games_sig = [], None
+        self.timeup = {"warn_minutes": list(DEFAULT_WARN_MINUTES), "close_game": True}
+        self.topup = {"kind": None, "upi": False, "options": [30, 60, 120], "last": None}
+        self.rate = 0.0
+        self.topup_win = None
 
         self.root = tk.Tk()
         self.root.title("CafeMaster")
@@ -330,6 +335,9 @@ class AgentApp:
         self.l_status = tk.Label(box, text="Walk-in? Pay at the counter and staff will unlock this PC.",
                                  font=("Segoe UI", 10), fg=MUTED, bg=PANEL, wraplength=320)
         self.l_status.pack(pady=(8, 0))
+        self.b_extend = tk.Button(box, text="Time up? Pay here to extend", command=self.open_topup, bg="#2ea043",
+                                  fg="white", activebackground="#2ea043", relief="flat",
+                                  font=("Segoe UI", 11, "bold"), padx=10, pady=6, cursor="hand2")
         tk.Label(box, text="Notice: staff may view this PC's screen and close programs\n"
                            "to keep the cafe safe and enforce cafe rules.",
                  font=("Segoe UI", 9), fg=MUTED, bg=PANEL, justify="center").pack(pady=(14, 0))
@@ -407,6 +415,9 @@ class AgentApp:
         self.o_games = tk.Button(self.o_detail, text="Games", command=lambda: self.show_launcher(), bg="#1f2630",
                                  fg=TEXT, relief="flat", font=("Segoe UI", 9), cursor="hand2",
                                  activebackground="#2b3440")
+        self.o_topup = tk.Button(self.o_detail, text="Top up", command=self.open_topup, bg="#2ea043", fg="white",
+                                 relief="flat", font=("Segoe UI", 9, "bold"), cursor="hand2",
+                                 activebackground="#2ea043")
         self.compact = False
         for w in (f, self.o_time, self.o_title):
             w.bind("<ButtonPress-1>", self._drag_start)
@@ -513,7 +524,179 @@ class AgentApp:
         self.launcher.after(1500, self.launcher.withdraw)
         self.link.call_async("launch", {"game_id": game["id"]}, "launched")
 
+    # ---- top-up with UPI QR ---------------------------------------------------
+    def open_topup(self):
+        if not self.topup.get("kind"):
+            self.popup("Top-up isn't available right now. Please see staff.", "Top up")
+            return
+        if self.topup_win and self.topup_win.winfo_exists():
+            self.topup_win.lift()
+            return
+        w = self.topup_win = tk.Toplevel(self.root, bg=PANEL)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        self._topup_req = None
+        self._topup_frame = tk.Frame(w, bg=PANEL, padx=28, pady=22, highlightthickness=2,
+                                     highlightbackground="#2ea043")
+        self._topup_frame.pack()
+        self._topup_choose()
+        w.lift()
+        w.focus_force()
+        self.root.after(200, lambda: mon.force_foreground(self._hwnd(w)))
+
+    def _topup_clear(self, title):
+        for c in self._topup_frame.winfo_children():
+            c.destroy()
+        tk.Label(self._topup_frame, text=title, font=("Segoe UI", 18, "bold"), fg=TEXT, bg=PANEL).pack(anchor="w")
+
+    def _topup_center(self):
+        w = self.topup_win
+        w.update_idletasks()
+        w.geometry(f"+{(w.winfo_screenwidth() - w.winfo_reqwidth()) // 2}"
+                   f"+{max(20, (w.winfo_screenheight() - w.winfo_reqheight()) // 2)}")
+
+    def _btn(self, parent, text, cmd, color=ACCENT, **kw):
+        return tk.Button(parent, text=text, command=cmd, bg=color, fg="white", activebackground=color,
+                         relief="flat", font=("Segoe UI", 11, "bold"), padx=14, pady=6, cursor="hand2", **kw)
+
+    def _topup_choose(self):
+        kind = self.topup["kind"]
+        self._topup_clear("Add more time" if kind != "balance" else "Top up your balance")
+        f = self._topup_frame
+        sub = {"time": "Pick how much time to add. It is added as soon as staff confirm your payment.",
+               "extend": "Your time ran out. Pay now to unlock this PC again.",
+               "balance": "Money is added to your member balance."}[kind]
+        tk.Label(f, text=sub, font=("Segoe UI", 10), fg=MUTED, bg=PANEL, wraplength=420,
+                 justify="left").pack(anchor="w", pady=(2, 14))
+        grid = tk.Frame(f, bg=PANEL)
+        grid.pack(fill="x")
+        for i, m in enumerate(self.topup.get("options") or [30, 60, 120]):
+            amt = self.rate * m / 60
+            label = (f"+{m // 60} hr" if m % 60 == 0 else f"+{m} min") + f"\n{self.currency}{amt:g}"
+            b = tk.Button(grid, text=label, command=lambda m=m: self._topup_method(m), bg="#1f2630", fg=TEXT,
+                          activebackground="#2b3440", relief="flat", font=("Segoe UI", 13, "bold"),
+                          width=8, pady=10, cursor="hand2")
+            b.grid(row=0, column=i, padx=(0, 10))
+        row = tk.Frame(f, bg=PANEL)
+        row.pack(fill="x", pady=(18, 0))
+        self._btn(row, "Close", self._topup_close, "#1f2630").pack(side="right")
+        self._topup_center()
+
+    def _topup_method(self, minutes):
+        amt = self.rate * minutes / 60
+        self._topup_clear(f"Pay {self.currency}{amt:g} for +{minutes} min")
+        f = self._topup_frame
+        row = tk.Frame(f, bg=PANEL)
+        row.pack(fill="x", pady=(16, 0))
+        if self.topup.get("upi"):
+            self._btn(row, "Pay by UPI (scan QR)", lambda: self._topup_send(minutes, "upi"), "#2ea043").pack(
+                side="left", padx=(0, 10))
+        self._btn(row, "Pay at counter", lambda: self._topup_send(minutes, "counter")).pack(side="left", padx=(0, 10))
+        self._btn(row, "Back", self._topup_choose, "#1f2630").pack(side="left")
+        self._topup_center()
+
+    def _topup_send(self, minutes, method):
+        self._topup_clear("One moment…")
+        self.link.call_async("topup", {"minutes": minutes, "method": method}, "topup_req")
+
+    def _on_topup_req(self, r):
+        if not (self.topup_win and self.topup_win.winfo_exists()):
+            return
+        self._topup_req = r
+        f = self._topup_frame
+        if r["method"] == "upi":
+            self._topup_clear(f"Scan to pay {r['currency']}{r['amount']:g}")
+            link = qr.upi_link(r["upi_id"], r["payee"], r["amount"], r["note"])
+            self._draw_qr(f, qr.make(link))
+            tk.Label(f, text=f"Use any UPI app: GPay, PhonePe, Paytm, BHIM\nPaying to {r['upi_id']}  ·  Ref {r['ref']}",
+                     font=("Segoe UI", 10), fg=MUTED, bg=PANEL, justify="center").pack(pady=(8, 0))
+        else:
+            self._topup_clear(f"Pay {r['currency']}{r['amount']:g} at the counter")
+            tk.Label(f, text=f"Tell staff your PC name ({self.cfg['name']}) and reference {r['ref']}.",
+                     font=("Segoe UI", 11), fg=TEXT, bg=PANEL).pack(anchor="w", pady=(8, 0))
+        self._topup_msg = tk.Label(f, text="Waiting for staff to confirm your payment…", font=("Segoe UI", 11),
+                                   fg="#e3b341", bg=PANEL)
+        self._topup_msg.pack(pady=(12, 0))
+        row = tk.Frame(f, bg=PANEL)
+        row.pack(fill="x", pady=(14, 0))
+        self._btn(row, "Hide (keep playing)", self.topup_win.withdraw, "#1f2630").pack(side="left")
+        self._btn(row, "Cancel payment", self._topup_cancel, "#1f2630").pack(side="right")
+        self._topup_center()
+
+    def _on_topup_req_error(self, err):
+        if self.topup_win and self.topup_win.winfo_exists():
+            self._topup_clear("Couldn't start payment")
+            tk.Label(self._topup_frame, text=err, font=("Segoe UI", 11), fg=RED, bg=PANEL, wraplength=420).pack(
+                anchor="w", pady=(8, 0))
+            self._btn(self._topup_frame, "Close", self._topup_close, "#1f2630").pack(anchor="e", pady=(14, 0))
+            self._topup_center()
+
+    def _draw_qr(self, parent, matrix, px=6, border=4):
+        n = len(matrix)
+        size = (n + 2 * border) * px
+        c = tk.Canvas(parent, width=size, height=size, bg="white", highlightthickness=0)
+        c.pack(pady=(12, 0))
+        for y, row in enumerate(matrix):
+            for x, dark in enumerate(row):
+                if dark:
+                    x0, y0 = (x + border) * px, (y + border) * px
+                    c.create_rectangle(x0, y0, x0 + px, y0 + px, fill="black", outline="")
+
+    def _topup_status(self):
+        """Follow the pending request via the heartbeat and react when staff approve or reject."""
+        req, last = getattr(self, "_topup_req", None), self.topup.get("last")
+        if not req or not last or last["id"] != req["id"] or last["status"] == "pending":
+            return
+        if not (self.topup_win and self.topup_win.winfo_exists()):
+            self._topup_req = None
+            return
+        ok = last["status"] == "approved"
+        self.topup_win.deiconify()
+        self._topup_msg.config(text="Payment confirmed. Time added. Enjoy!" if ok
+                               else f"Payment {last['status']}. Please see staff at the counter.",
+                               fg="#2ea043" if ok else RED)
+        self._topup_req = None
+        if ok:
+            self.root.after(2500, self._topup_close)
+
+    def _topup_cancel(self):
+        if self._topup_req:
+            self.link.call_async("topup", {"cancel": True}, "topup_cancel")
+        self._topup_close()
+
+    def _topup_close(self):
+        self._topup_req = None
+        if self.topup_win and self.topup_win.winfo_exists():
+            self.topup_win.destroy()
+        self.topup_win = None
+
     # ---- popups -------------------------------------------------------------
+    def warn_toast(self, text, title):
+        """Time warning: shows on top of the game without taking keyboard focus, beeps, closes itself."""
+        t = tk.Toplevel(self.root, bg=PANEL)
+        self._toasts = [w for w in getattr(self, "_toasts", []) if w.winfo_exists()] + [t]
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        f = tk.Frame(t, bg=PANEL, padx=22, pady=14, highlightthickness=3, highlightbackground=RED)
+        f.pack()
+        tk.Label(f, text=title, font=("Segoe UI", 18, "bold"), fg=RED, bg=PANEL).pack(anchor="w")
+        tk.Label(f, text=text, font=("Segoe UI", 12), fg=TEXT, bg=PANEL, wraplength=440,
+                 justify="left").pack(anchor="w", pady=(4, 10))
+        row = tk.Frame(f, bg=PANEL)
+        row.pack(anchor="e")
+        if self.topup.get("kind"):
+            tk.Button(row, text="Top up now", command=lambda: (t.destroy(), self.open_topup()), bg="#2ea043",
+                      fg="white", relief="flat", padx=14, font=("Segoe UI", 10, "bold"),
+                      cursor="hand2").pack(side="left", padx=(0, 8))
+        tk.Button(row, text="OK", command=t.destroy, bg=ACCENT, fg="white", relief="flat", padx=18,
+                  font=("Segoe UI", 10, "bold"), cursor="hand2").pack(side="left")
+        t.update_idletasks()
+        t.geometry(f"+{(t.winfo_screenwidth() - t.winfo_reqwidth()) // 2}+40")
+        t.lift()
+        mon.beep()
+        self.root.bell()
+        t.after(15_000, lambda: t.winfo_exists() and t.destroy())
+
     def popup(self, text, title="Message from staff", urgent=False):
         t = tk.Toplevel(self.root, bg=PANEL)
         t.overrideredirect(True)
@@ -582,6 +765,10 @@ class AgentApp:
         self.l_rate.config(text=f'{self.currency}{d["rate"]:g} per hour')
         self.l_conn.config(text=f"Connected to {self.cfg['server']}", fg=MUTED)
         self.games = d.get("games") or []
+        self.timeup = d.get("timeup") or self.timeup
+        self.topup = d.get("topup") or self.topup
+        self.rate = (d.get("session") or {}).get("rate") or d.get("rate") or 0
+        self._topup_status()
         if self.launcher.winfo_viewable():
             self._render_games()
         new = d.get("session")
@@ -649,20 +836,64 @@ class AgentApp:
     def _apply(self, state):
         if state == self.state:
             return
+        was_active = self.state == "active"
         self.state = state
         if state == "locked":
+            for w in getattr(self, "_toasts", []):     # "N minutes left" no longer applies
+                if w.winfo_exists():
+                    w.destroy()
+            self._toasts = []
+            if was_active:
+                # a full-screen game can sit above our window: close (or minimise) it first
+                app = mon.clear_foreground_app(close=self.timeup.get("close_game", True),
+                                               dry_run=self.cfg.get("dry_run"))
+                if app:
+                    print("cleared for lock:", app, flush=True)
             self.show_lock()
+            self.root.after(300, lambda: mon.force_foreground(self._hwnd(self.root)))
         else:
             self.hide_lock()
+
+    @staticmethod
+    def _hwnd(win):
+        try:
+            return int(win.wm_frame(), 16)
+        except (tk.TclError, ValueError):
+            return win.winfo_id()
+
+    def _warn(self, rem, s):
+        """Show one pop-up when a warning threshold is crossed; re-arm after a top-up."""
+        marks = sorted(self.timeup.get("warn_minutes") or DEFAULT_WARN_MINUTES)
+        for m in marks:
+            if rem > m * 60 + 30:
+                self.warned.discard(m)              # time was added: warn again next time
+        crossed = [m for m in marks if rem <= m * 60 and m not in self.warned]
+        if not crossed or rem <= 0:
+            return
+        self.warned.update(m for m in marks if rem <= m * 60)
+        left = max(1, int(rem // 60) + (1 if rem % 60 > 30 else 0))
+        how = ("Tap Top up now to keep playing." if self.topup.get("kind")
+               else "Ask staff to add time." if s["mode"] == "prepaid" else "Top up at the counter to keep playing.")
+        self.warn_toast(f"Your PC locks automatically when time runs out. {how}",
+                        f"{left} minute{'s' if left != 1 else ''} left")
 
     def _tick(self):
         s = self.session
         srv_now = time.time() + self.offset
         if self.state == "locked":
             self.l_clock.config(text=time.strftime("%H:%M"))
-            # keep the lock screen on top
+            if self.topup.get("kind") == "extend":
+                self.b_extend.pack(fill="x", pady=(10, 0))
+            else:
+                self.b_extend.pack_forget()
+            # keep the lock screen on top, but keep messages and the payment window above it
             self.root.attributes("-topmost", True)
             self.root.lift()
+            for w in self.root.winfo_children():
+                if isinstance(w, tk.Toplevel) and w not in (self.overlay, self.launcher) \
+                        and w.winfo_exists() and w.winfo_viewable():
+                    w.attributes("-topmost", True)
+                    w.lift()
         elif s:
             mode_txt = {"prepaid": "Prepaid", "postpaid": "Pay later", "member": "Member", "free": "Free"}
             title = f'{self.cfg["name"]} · {s["user"]} · {s.get("package") or mode_txt.get(s["mode"], "")}'
@@ -670,12 +901,7 @@ class AgentApp:
             if s.get("ends"):
                 rem = s["ends"] - srv_now
                 self.o_time.config(text=fmt_dur(rem) + " left", fg=RED if rem < 300 else TEXT)
-                for w in WARN_AT:
-                    if rem <= w and w not in self.warned and rem > 0:
-                        self.warned.add(w)
-                        self.popup(f"{w // 60} minute{'s' if w > 60 else ''} left. "
-                                   f"{'Top up at the counter to keep playing.' if s['mode'] == 'member' else 'Ask staff to add time.'}",
-                                   "Time almost up", urgent=True)
+                self._warn(rem, s)
                 if rem <= 0:  # enforce locally even if the server is unreachable
                     self.session = None
                     self._apply("locked")
@@ -692,6 +918,10 @@ class AgentApp:
             else:
                 self.o_end.pack_forget()
                 self.g_end.pack_forget()
+            if self.topup.get("kind"):
+                self.o_topup.pack(anchor="w", pady=(6, 0))
+            else:
+                self.o_topup.pack_forget()
             if self.games:
                 self.o_games.pack(anchor="w", pady=(6, 0))
             else:

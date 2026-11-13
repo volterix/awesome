@@ -31,7 +31,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OFFLINE_AFTER = 10          # seconds without heartbeat => PC shown offline
 VALID_COMMANDS = {"message", "shutdown", "restart", "lock", "logoff", "launch", "kill", "processes"}
 WATCH_SECONDS = 12          # a PC keeps streaming its screen this long after the dashboard last asked
-ALERT_IMAGE_DAYS = 7        # alert screenshots are deleted after this many days
+ALERT_IMAGE_DAYS = 7
+EXTEND_WINDOW = 30 * 60     # a walk-in can pay to extend from the lock screen this long after time ran out
+TOPUP_EXPIRES = 15 * 60     # unanswered top-up requests expire after this
+UPI_RE = r"^[\w.\-]{2,256}@[A-Za-z][\w.]{1,64}$"        # alert screenshots are deleted after this many days
 PROTECTED_PROCS = {"system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
                    "lsass.exe", "svchost.exe", "dwm.exe", "python.exe", "pythonw.exe", "explorer.exe"}
 
@@ -44,6 +47,15 @@ DEFAULT_CONFIG = {
     "rates": {"Standard": 60, "VIP": 100},  # per hour
     "min_minutes": 15,                      # minimum billable minutes (postpaid/member)
     "round_to_minutes": 1,                  # bill in blocks of N minutes
+    "timeup": {
+        "warn_minutes": [10, 5, 1],         # pop-ups on the PC this many minutes before time runs out
+        "close_game": True,                 # close the game in front when time is up, so the lock shows
+    },
+    "payments": {
+        "upi_id": "",                       # e.g. cafename@okhdfcbank - enables the QR code on PCs
+        "payee_name": "",
+        "topup_options": [30, 60, 120],     # minutes offered on the PC's top-up screen
+    },
     "monitoring": {
         "screen_view": True,
         "blocked_apps": ["qbittorrent.exe", "utorrent.exe", "bittorrent.exe", "tor.exe", "vuze.exe"],
@@ -143,6 +155,10 @@ class Cafe:
             CREATE TABLE IF NOT EXISTS packages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, minutes INTEGER,
                 price REAL, rigs INTEGER DEFAULT 1, game_id INTEGER, active INTEGER DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS topups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, pc_id TEXT, pc_name TEXT,
+                session_id INTEGER, member_id INTEGER, user_label TEXT, kind TEXT, minutes INTEGER,
+                amount REAL, method TEXT, status TEXT DEFAULT 'pending', handled REAL);
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, pc_id TEXT, pc_name TEXT,
                 user_label TEXT, session_id INTEGER, kind TEXT, detail TEXT, action TEXT,
@@ -174,8 +190,11 @@ class Cafe:
 
     def public_settings(self):
         c = self.cfg
-        return {k: c[k] for k in ("cafe_name", "currency", "rates", "min_minutes", "round_to_minutes",
-                                  "monitoring")}
+        return {k: c.get(k, DEFAULT_CONFIG.get(k)) for k in (
+            "cafe_name", "currency", "rates", "min_minutes", "round_to_minutes", "monitoring", "timeup", "payments")}
+
+    def _section(self, name):
+        return dict(DEFAULT_CONFIG[name], **self.cfg.get(name, {}))
 
     def policy(self):
         m = dict(DEFAULT_CONFIG["monitoring"], **self.cfg.get("monitoring", {}))
@@ -195,6 +214,33 @@ class Cafe:
             for key in ("min_minutes", "round_to_minutes"):
                 if key in data:
                     self.cfg[key] = max(0 if key == "min_minutes" else 1, int(data[key]))
+            if "timeup" in data:
+                t, cur = data["timeup"], self._section("timeup")
+                if "warn_minutes" in t:
+                    raw = t["warn_minutes"]
+                    raw = raw.replace(",", " ").split() if isinstance(raw, str) else raw
+                    mins = sorted({int(x) for x in raw if 0 < int(x) <= 120}, reverse=True)[:6]
+                    cur["warn_minutes"] = mins
+                if "close_game" in t:
+                    cur["close_game"] = bool(t["close_game"])
+                self.cfg["timeup"] = cur
+            if "payments" in data:
+                pay, cur = data["payments"], self._section("payments")
+                if "upi_id" in pay:
+                    upi = str(pay["upi_id"]).strip()
+                    if upi and not re.match(UPI_RE, upi):
+                        raise ApiError(400, "UPI ID looks wrong. It should look like name@bank")
+                    cur["upi_id"] = upi
+                if "payee_name" in pay:
+                    cur["payee_name"] = str(pay["payee_name"]).strip()[:50]
+                if "topup_options" in pay:
+                    raw = pay["topup_options"]
+                    raw = raw.replace(",", " ").split() if isinstance(raw, str) else raw
+                    opts = sorted({int(x) for x in raw if 0 < int(x) <= 600})[:6]
+                    if not opts:
+                        raise ApiError(400, "Give at least one top-up option in minutes")
+                    cur["topup_options"] = opts
+                self.cfg["payments"] = cur
             if "monitoring" in data:
                 m, cur = data["monitoring"], dict(DEFAULT_CONFIG["monitoring"], **self.cfg.get("monitoring", {}))
                 for key in ("blocked_apps", "blocked_keywords", "blocked_sites"):
@@ -440,6 +486,9 @@ class Cafe:
         """Expire sessions whose time ran out. Called every second."""
         with self.lock:
             t = now()
+            self.db.execute("UPDATE topups SET status='expired', handled=? WHERE status='pending' AND ts<?",
+                            (t, t - TOPUP_EXPIRES))
+            self.db.commit()   # always commit: an open transaction would lock the database file
             for s in self.db.execute(
                     "SELECT pc_id FROM sessions WHERE ended IS NULL AND ends IS NOT NULL AND ends<=?",
                     (t,)).fetchall():
@@ -541,6 +590,7 @@ class Cafe:
                 "session": s, "commands": commands,
                 "games": self.games_for_pc(pc_id),
                 "watch": self.watch_mode(pc_id), "policy": self.policy(),
+                "timeup": self._section("timeup"), "topup": self.topup_info(pc_id),
             }
 
     def update_pc(self, pc_id, data):
@@ -605,7 +655,113 @@ class Cafe:
             return {"server_time": t, "settings": self.public_settings(), "pcs": pcs,
                     "games": self.list_games(), "packages": self.list_packages(),
                     "alerts_open": self.db.execute("SELECT COUNT(*) FROM alerts WHERE acked=0").fetchone()[0],
+                    "topups_pending": self.list_topups("pending"),
                     "today": self.report(dt.date.today().isoformat())["totals"]}
+
+    # ---- top-ups from the PC (UPI QR or pay at counter, confirmed by staff) -------
+    def _topup_kind(self, pc_id):
+        """What a top-up on this PC would do: 'time' (prepaid), 'balance' (member),
+        'extend' (walk-in whose time just ran out) or None."""
+        s = self.active_session(pc_id)
+        if s:
+            return ({"prepaid": "time", "member": "balance"}.get(s["mode"]), s)
+        last = self.db.execute(
+            "SELECT * FROM sessions WHERE pc_id=? AND ended IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (pc_id,)).fetchone()
+        if last and last["mode"] == "prepaid" and last["end_reason"] == "time_up" \
+                and now() - last["ended"] < EXTEND_WINDOW:
+            return "extend", last
+        return None, None
+
+    def topup_info(self, pc_id):
+        kind, _ = self._topup_kind(pc_id)
+        pay = self._section("payments")
+        last = self.db.execute("SELECT id, status, minutes, amount, method FROM topups WHERE pc_id=? AND ts>?"
+                               " ORDER BY id DESC LIMIT 1", (pc_id, now() - TOPUP_EXPIRES - 300)).fetchone()
+        return {"kind": kind, "upi": bool(pay["upi_id"]), "options": pay["topup_options"],
+                "last": dict(last) if last else None}
+
+    def request_topup(self, pc_id, minutes, method="upi"):
+        if method not in ("upi", "counter"):
+            raise ApiError(400, "Payment method must be upi or counter")
+        minutes = int(minutes or 0)
+        if not 0 < minutes <= 600:
+            raise ApiError(400, "Choose how many minutes to add")
+        with self.lock:
+            pc = self._pc(pc_id)
+            kind, s = self._topup_kind(pc_id)
+            if not kind:
+                raise ApiError(409, "Top-up isn't available on this PC right now. Please see staff.")
+            pay = self._section("payments")
+            if method == "upi" and not pay["upi_id"]:
+                raise ApiError(400, "UPI payment isn't set up. Please pay at the counter.")
+            rate = s["rate"] if kind != "extend" else self.rate_for(pc["grp"])
+            amount = self.cost(rate, minutes)
+            self.db.execute("UPDATE topups SET status='cancelled', handled=? WHERE pc_id=? AND status='pending'",
+                            (now(), pc_id))
+            cur = self.db.execute(
+                "INSERT INTO topups (ts, pc_id, pc_name, session_id, member_id, user_label, kind, minutes, amount,"
+                " method) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (now(), pc_id, pc["name"], s["id"], s["member_id"], s["user_label"], kind, minutes, amount, method))
+            self.db.commit()
+            tid = cur.lastrowid
+            out = {"id": tid, "ref": f"T{tid}", "amount": amount, "minutes": minutes, "kind": kind,
+                   "method": method, "currency": self.cfg["currency"]}
+            if method == "upi":
+                out.update(upi_id=pay["upi_id"], payee=pay["payee_name"] or self.cfg["cafe_name"],
+                           note=f"{pc['name']} +{minutes} min T{tid}")
+            return out
+
+    def cancel_topup(self, pc_id):
+        with self.lock:
+            self.db.execute("UPDATE topups SET status='cancelled', handled=? WHERE pc_id=? AND status='pending'",
+                            (now(), pc_id))
+            self.db.commit()
+
+    def _pending(self, topup_id):
+        t = self.db.execute("SELECT * FROM topups WHERE id=?", (int(topup_id),)).fetchone()
+        if not t:
+            raise ApiError(404, "Top-up request not found")
+        if t["status"] != "pending":
+            raise ApiError(409, f"This request is already {t['status']}")
+        return t
+
+    def approve_topup(self, topup_id):
+        with self.lock:
+            t = self._pending(topup_id)
+            method = "upi" if t["method"] == "upi" else "cash"
+            if t["kind"] == "balance":
+                self.topup(t["member_id"], t["amount"], method)
+                msg = f"Payment received. {self.cfg['currency']}{t['amount']:.0f} added to your balance."
+            else:
+                s = self.active_session(t["pc_id"])
+                if s and (s["id"] == t["session_id"] or s["mode"] == "prepaid"):
+                    self.add_time(t["pc_id"], t["minutes"], method)
+                elif s:
+                    raise ApiError(409, "Another session is running on this PC now")
+                else:   # time ran out while waiting, or extending from the lock screen
+                    self.start_session(t["pc_id"], "prepaid", t["minutes"], label=t["user_label"],
+                                       method=method, price=t["amount"])
+                msg = f"Payment received. +{t['minutes']} minutes added. Enjoy!"
+            self.db.execute("UPDATE topups SET status='approved', handled=? WHERE id=?", (now(), t["id"]))
+            self.db.commit()
+            self.queue_command(t["pc_id"], {"type": "message", "text": msg})
+            return dict(t, status="approved")
+
+    def reject_topup(self, topup_id):
+        with self.lock:
+            t = self._pending(topup_id)
+            self.db.execute("UPDATE topups SET status='rejected', handled=? WHERE id=?", (now(), t["id"]))
+            self.db.commit()
+            self.queue_command(t["pc_id"], {"type": "message",
+                                            "text": "Your payment could not be confirmed. Please see staff at the counter."})
+
+    def list_topups(self, status=None, limit=50):
+        q, args = "SELECT * FROM topups", []
+        if status:
+            q += " WHERE status=?"
+            args.append(status)
+        return [dict(r) for r in self.db.execute(q + " ORDER BY id DESC LIMIT ?", args + [int(limit)])]
 
     # ---- monitoring: live screens, processes, alerts ---------------------------
     def _live(self, pc_id):
@@ -1002,8 +1158,10 @@ def make_handler(cafe):
             self._dispatch("DELETE")
 
         def _dispatch(self, method):
+            ok = False
             try:
                 self._route(method)
+                ok = True
             except ApiError as e:
                 self._json({"error": e.message}, e.status)
             except (ValueError, TypeError, KeyError) as e:
@@ -1011,6 +1169,11 @@ def make_handler(cafe):
             except Exception as e:  # pragma: no cover
                 self.log_error("Unhandled: %r", e)
                 self._json({"error": "Server error"}, 500)
+            finally:
+                # never leave a half-finished write open: it would lock the database file
+                with cafe.lock:
+                    if cafe.db.in_transaction:
+                        cafe.db.commit() if ok else cafe.db.rollback()
 
         # -- routes --
         def _route(self, method):
@@ -1052,6 +1215,11 @@ def make_handler(cafe):
                 if action == "processes":
                     cafe.put_processes(pc_id, body.get("list"))
                     return self._json({"ok": True})
+                if action == "topup":
+                    if body.get("cancel"):
+                        cafe.cancel_topup(pc_id)
+                        return self._json({"ok": True})
+                    return self._json(cafe.request_topup(pc_id, body.get("minutes"), body.get("method", "upi")))
                 if action == "alert":
                     img = base64.b64decode(body["image"]) if body.get("image") else None
                     mime = body.get("mime") if img else None
@@ -1095,6 +1263,16 @@ def make_handler(cafe):
                     if qs.get("refresh"):
                         cafe.command(pc_id, "processes")
                     return self._json(cafe.get_processes(pc_id))
+
+            if route == ["topups"] and method == "GET":
+                with cafe.lock:
+                    return self._json(cafe.list_topups(qs.get("status", [None])[0]))
+            if route[:1] == ["topups"] and len(route) == 3 and method == "POST":
+                if route[2] == "approve":
+                    return self._json({"ok": True, "topup": cafe.approve_topup(route[1])})
+                if route[2] == "reject":
+                    cafe.reject_topup(route[1])
+                    return self._json({"ok": True})
 
             if route == ["alerts"] and method == "GET":
                 return self._json(cafe.list_alerts(only_open=bool(qs.get("open"))))

@@ -18,6 +18,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import zlib
 
 WINDOWS = platform.system() == "Windows"
@@ -335,3 +336,68 @@ def apply_site_blocks(domains, dry_run=False, path=None):
     if WINDOWS:
         subprocess.run(["ipconfig", "/flushdns"], capture_output=True, creationflags=NO_WINDOW)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Getting the lock screen in front of a running game
+# --------------------------------------------------------------------------- #
+def own_process_name():
+    return os.path.basename(sys.executable).lower()
+
+
+def clear_foreground_app(close=True, dry_run=False):
+    """Close (or minimise) whatever app is in front, so the lock screen can show.
+
+    Returns the app name that was closed/minimised, or "".
+    Never touches protected system processes or the agent itself.
+    """
+    fg = foreground()
+    app = (fg.get("app") or "").strip()
+    if not app or is_protected(app) or app.lower() == own_process_name():
+        return ""
+    if close:
+        return app if kill_process(app, dry_run) is None else ""
+    if WINDOWS and not dry_run:
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetForegroundWindow.restype = ctypes.c_void_p
+            user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.ShowWindow(user32.GetForegroundWindow(), 6)   # SW_MINIMIZE
+        except Exception:
+            return ""
+    return app
+
+
+def force_foreground(hwnd):
+    """Bring a window to the very front on Windows, even if a game currently has focus."""
+    if not WINDOWS or not hwnd:
+        return
+    try:
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        for fn in ("GetForegroundWindow",):
+            getattr(user32, fn).restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4 + [ctypes.c_uint]
+        for fn in ("ShowWindow", "SetForegroundWindow", "BringWindowToTop", "SetFocus"):
+            getattr(user32, fn).argtypes = [ctypes.c_void_p] + ([ctypes.c_int] if fn == "ShowWindow" else [])
+        fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+        me = kernel32.GetCurrentThreadId()
+        attached = fg_thread and fg_thread != me and user32.AttachThreadInput(fg_thread, me, True)
+        user32.ShowWindow(hwnd, 9)                                        # SW_RESTORE
+        user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0043)  # HWND_TOPMOST, no move/size, show
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+        user32.SetFocus(hwnd)
+        if attached:
+            user32.AttachThreadInput(fg_thread, me, False)
+    except Exception:
+        pass
+
+
+def beep():
+    if WINDOWS:
+        try:
+            import winsound
+            winsound.MessageBeep(0x30)   # MB_ICONEXCLAMATION
+        except Exception:
+            pass
